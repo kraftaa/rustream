@@ -240,7 +240,7 @@ async fn sync_table(
 }
 
 /// Extract the watermark value from the last row of a batch.
-fn extract_watermark(
+pub(crate) fn extract_watermark(
     columns: &[ColumnInfo],
     batch: &arrow::record_batch::RecordBatch,
     watermark_col: &str,
@@ -284,5 +284,115 @@ fn extract_watermark(
             Some(arr.value(last_row).to_string())
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray, TimestampMicrosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    #[test]
+    fn extract_watermark_from_timestamp() {
+        let columns = vec![ColumnInfo {
+            name: "updated_at".into(),
+            pg_type: "timestamptz".into(),
+            arrow_type: DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            is_nullable: true,
+        }];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "updated_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        )]));
+
+        // 2026-02-10 12:00:00 UTC in microseconds
+        let micros = 1_770_681_600_000_000i64;
+        let arr = TimestampMicrosecondArray::from(vec![Some(micros)]).with_timezone("UTC");
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+
+        let wm = extract_watermark(&columns, &batch, "updated_at");
+        assert!(wm.is_some());
+        assert!(wm.unwrap().starts_with("2026-02-10"));
+    }
+
+    #[test]
+    fn extract_watermark_from_int64() {
+        let columns = vec![ColumnInfo {
+            name: "id".into(),
+            pg_type: "bigint".into(),
+            arrow_type: DataType::Int64,
+            is_nullable: false,
+        }];
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let arr = Int64Array::from(vec![100, 200, 300]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+
+        let wm = extract_watermark(&columns, &batch, "id");
+        assert_eq!(wm, Some("300".to_string()));
+    }
+
+    #[test]
+    fn extract_watermark_from_utf8() {
+        let columns = vec![ColumnInfo {
+            name: "version".into(),
+            pg_type: "text".into(),
+            arrow_type: DataType::Utf8,
+            is_nullable: true,
+        }];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "version",
+            DataType::Utf8,
+            true,
+        )]));
+        let arr = StringArray::from(vec!["v1", "v2", "v3"]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+
+        let wm = extract_watermark(&columns, &batch, "version");
+        assert_eq!(wm, Some("v3".to_string()));
+    }
+
+    #[test]
+    fn extract_watermark_missing_column() {
+        let columns = vec![ColumnInfo {
+            name: "id".into(),
+            pg_type: "integer".into(),
+            arrow_type: DataType::Int32,
+            is_nullable: false,
+        }];
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let arr = arrow::array::Int32Array::from(vec![1]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+
+        let wm = extract_watermark(&columns, &batch, "nonexistent");
+        assert_eq!(wm, None);
+    }
+
+    #[test]
+    fn extract_watermark_null_value() {
+        let columns = vec![ColumnInfo {
+            name: "updated_at".into(),
+            pg_type: "bigint".into(),
+            arrow_type: DataType::Int64,
+            is_nullable: true,
+        }];
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "updated_at",
+            DataType::Int64,
+            true,
+        )]));
+        let arr = Int64Array::from(vec![None::<i64>]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+
+        let wm = extract_watermark(&columns, &batch, "updated_at");
+        assert_eq!(wm, None);
     }
 }

@@ -2615,6 +2615,7 @@ dependencies = [
  "arrow",
  "aws-config",
  "aws-sdk-s3",
+ "bytes",
  "chrono",
  "clap",
  "parquet",

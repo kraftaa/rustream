@@ -167,6 +167,99 @@ fn rows_to_array(rows: &[Row], col_idx: usize, arrow_type: &DataType) -> Result<
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_table(name: &str) -> TableConfig {
+        TableConfig {
+            name: name.into(),
+            schema: None,
+            columns: None,
+            incremental_column: None,
+            partition_by: None,
+        }
+    }
+
+    fn make_columns() -> Vec<ColumnInfo> {
+        vec![
+            ColumnInfo {
+                name: "id".into(),
+                pg_type: "integer".into(),
+                arrow_type: DataType::Int32,
+                is_nullable: false,
+            },
+            ColumnInfo {
+                name: "name".into(),
+                pg_type: "text".into(),
+                arrow_type: DataType::Utf8,
+                is_nullable: true,
+            },
+            ColumnInfo {
+                name: "updated_at".into(),
+                pg_type: "timestamptz".into(),
+                arrow_type: DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                is_nullable: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn build_query_full_table() {
+        let table = make_table("users");
+        let cols = make_columns();
+        let q = build_query(&table, &cols, None, None, 1000);
+        assert_eq!(
+            q,
+            "SELECT \"id\", \"name\", \"updated_at\" FROM users LIMIT 1000"
+        );
+    }
+
+    #[test]
+    fn build_query_with_schema() {
+        let table = TableConfig {
+            name: "users".into(),
+            schema: Some("analytics".into()),
+            columns: None,
+            incremental_column: None,
+            partition_by: None,
+        };
+        let cols = make_columns();
+        let q = build_query(&table, &cols, None, None, 500);
+        assert_eq!(
+            q,
+            "SELECT \"id\", \"name\", \"updated_at\" FROM analytics.users LIMIT 500"
+        );
+    }
+
+    #[test]
+    fn build_query_with_watermark_no_value() {
+        let table = make_table("users");
+        let cols = make_columns();
+        let q = build_query(&table, &cols, Some("updated_at"), None, 1000);
+        assert_eq!(
+            q,
+            "SELECT \"id\", \"name\", \"updated_at\" FROM users ORDER BY \"updated_at\" ASC LIMIT 1000"
+        );
+    }
+
+    #[test]
+    fn build_query_with_watermark_value() {
+        let table = make_table("users");
+        let cols = make_columns();
+        let q = build_query(
+            &table,
+            &cols,
+            Some("updated_at"),
+            Some("2026-01-01 00:00:00"),
+            1000,
+        );
+        assert!(q.contains("WHERE \"updated_at\" > '2026-01-01 00:00:00'"));
+        assert!(q.contains("ORDER BY \"updated_at\" ASC"));
+        assert!(q.ends_with("LIMIT 1000"));
+    }
+}
+
 /// Try to get a PG column value as a String, handling various types.
 fn get_as_string(row: &Row, idx: usize) -> Option<String> {
     let col_type = row.columns()[idx].type_();

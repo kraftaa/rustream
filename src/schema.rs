@@ -84,3 +84,51 @@ pub fn build_arrow_schema(columns: &[ColumnInfo]) -> Arc<Schema> {
         .collect();
     Arc::new(Schema::new(fields))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_schema_from_columns() {
+        let columns = vec![
+            ColumnInfo {
+                name: "id".into(),
+                pg_type: "integer".into(),
+                arrow_type: DataType::Int32,
+                is_nullable: false,
+            },
+            ColumnInfo {
+                name: "email".into(),
+                pg_type: "text".into(),
+                arrow_type: DataType::Utf8,
+                is_nullable: true,
+            },
+            ColumnInfo {
+                name: "active".into(),
+                pg_type: "boolean".into(),
+                arrow_type: DataType::Boolean,
+                is_nullable: true,
+            },
+        ];
+
+        let schema = build_arrow_schema(&columns);
+        assert_eq!(schema.fields().len(), 3);
+
+        let id_field = schema.field(0);
+        assert_eq!(id_field.name(), "id");
+        assert_eq!(*id_field.data_type(), DataType::Int32);
+        assert!(!id_field.is_nullable());
+
+        let email_field = schema.field(1);
+        assert_eq!(email_field.name(), "email");
+        assert_eq!(*email_field.data_type(), DataType::Utf8);
+        assert!(email_field.is_nullable());
+    }
+
+    #[test]
+    fn build_schema_empty_columns() {
+        let schema = build_arrow_schema(&[]);
+        assert_eq!(schema.fields().len(), 0);
+    }
+}
