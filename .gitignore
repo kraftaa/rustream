@@ -1,0 +1,23 @@
+/target
+.rustream_state/
+*.parquet
+output/
+test_output/
+config.yaml
+config.test.yaml
+todo.md
+other/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Python
+__pycache__/
+*.egg-info/
+dist/
+.venv/
+
+# OS
+.DS_Store

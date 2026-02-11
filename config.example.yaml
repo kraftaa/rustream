@@ -1,0 +1,56 @@
+# rustream - Example Config
+# Copy to config.yaml and edit for your environment.
+#
+# Preview before syncing:
+#   rustream sync --config config.yaml --dry-run
+
+postgres:
+  host: localhost
+  port: 5432
+  database: mydb
+  user: postgres
+  password: secret
+
+# Output: local filesystem
+output:
+  type: local
+  path: ./output
+
+# Output: S3 (uncomment to use instead of local)
+# AWS credentials come from: env vars, ~/.aws/credentials, or IAM role
+# output:
+#   type: s3
+#   bucket: my-data-lake
+#   prefix: raw/postgres
+#   region: us-east-1
+
+# Batch size for reading rows from Postgres
+batch_size: 10000
+
+# Directory for SQLite state tracking (watermarks)
+state_dir: .rustream_state
+
+# Option 1: List specific tables
+tables:
+  - name: users
+    incremental_column: updated_at
+    columns:              # optional: pick specific columns
+      - id
+      - email
+      - full_name
+      - created_at
+      - updated_at
+
+  - name: orders
+    incremental_column: updated_at
+    partition_by: date      # table/year=2026/month=02/day=10/...
+    # partition_by: month   # table/year=2026/month=02/...
+    # partition_by: year    # table/year=2026/...
+
+  - name: products        # no incremental_column = full sync every run
+
+# Option 2: Auto-discover all tables (remove `tables` above and uncomment below)
+# schema: public          # which schema to discover from (default: public)
+# exclude:                # skip these tables
+#   - schema_migrations
+#   - ar_internal_metadata
