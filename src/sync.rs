@@ -1,8 +1,13 @@
 use anyhow::{anyhow, Context, Result};
+use arrow::record_batch::RecordBatch;
 use chrono::Utc;
+use iceberg::Catalog;
+use std::sync::Arc;
 use tokio_postgres::NoTls;
 
-use crate::config::{Config, PartitionBy, TableConfig};
+use crate::catalog;
+use crate::config::{Config, OutputFormat, PartitionBy, TableConfig};
+use crate::iceberg as iceberg_write;
 use crate::output;
 use crate::reader;
 use crate::schema::{self, ColumnInfo};
@@ -118,8 +123,18 @@ pub async fn run(config: Config) -> Result<()> {
         .unwrap_or_else(|| ".rustream_state".to_string());
     let state = StateStore::open(&state_dir)?;
 
+    // Build Iceberg catalog if format is iceberg
+    let iceberg_catalog: Option<Arc<dyn Catalog>> = if config.format == OutputFormat::Iceberg {
+        let warehouse = config.warehouse.as_deref().expect("validated at load");
+        let cat = catalog::build_catalog(warehouse, config.catalog.as_ref()).await?;
+        Some(cat)
+    } else {
+        None
+    };
+
     for table in &tables {
-        if let Err(e) = sync_table(&client, &config, table, &state).await {
+        if let Err(e) = sync_table(&client, &config, table, &state, iceberg_catalog.as_ref()).await
+        {
             tracing::error!(table = %table.full_name(), error = %e, "failed to sync table");
         }
     }
@@ -133,6 +148,7 @@ async fn sync_table(
     config: &Config,
     table: &TableConfig,
     state: &StateStore,
+    iceberg_catalog: Option<&Arc<dyn Catalog>>,
 ) -> Result<()> {
     let table_name = table.full_name();
     tracing::info!(table = %table_name, "starting sync");
@@ -220,6 +236,8 @@ async fn sync_table(
 
     let mut total_rows = 0u64;
     let mut batch_num = 0u32;
+    // Collect batches for Iceberg (needs all batches for a single commit)
+    let mut iceberg_batches: Vec<RecordBatch> = Vec::new();
 
     loop {
         let batch = reader::read_batch(
@@ -266,53 +284,69 @@ async fn sync_table(
             None => None,
         };
 
-        // Write parquet to buffer
-        let mut buf = Vec::new();
-        writer::write_parquet(&mut buf, &[batch])?;
+        match config.format {
+            OutputFormat::Parquet => {
+                // Write parquet to buffer
+                let mut buf = Vec::new();
+                writer::write_parquet(&mut buf, &[batch])?;
 
-        // Generate output filename
-        let now = Utc::now();
-        let filename = match &table.partition_by {
-            Some(PartitionBy::Date) => format!(
-                "{}/year={}/month={:02}/day={:02}/{}_{:04}.parquet",
-                table.name,
-                now.format("%Y"),
-                now.format("%m"),
-                now.format("%d"),
-                now.format("%H%M%S"),
-                batch_num
-            ),
-            Some(PartitionBy::Month) => format!(
-                "{}/year={}/month={:02}/{}_{:04}.parquet",
-                table.name,
-                now.format("%Y"),
-                now.format("%m"),
-                now.format("%d_%H%M%S"),
-                batch_num
-            ),
-            Some(PartitionBy::Year) => format!(
-                "{}/year={}/{}_{:04}.parquet",
-                table.name,
-                now.format("%Y"),
-                now.format("%m%d_%H%M%S"),
-                batch_num
-            ),
-            None => format!(
-                "{}/{}_{:04}.parquet",
-                table.name,
-                now.format("%Y%m%d_%H%M%S"),
-                batch_num
-            ),
-        };
+                // Generate output filename
+                let now = Utc::now();
+                let filename = match &table.partition_by {
+                    Some(PartitionBy::Date) => format!(
+                        "{}/year={}/month={:02}/day={:02}/{}_{:04}.parquet",
+                        table.name,
+                        now.format("%Y"),
+                        now.format("%m"),
+                        now.format("%d"),
+                        now.format("%H%M%S"),
+                        batch_num
+                    ),
+                    Some(PartitionBy::Month) => format!(
+                        "{}/year={}/month={:02}/{}_{:04}.parquet",
+                        table.name,
+                        now.format("%Y"),
+                        now.format("%m"),
+                        now.format("%d_%H%M%S"),
+                        batch_num
+                    ),
+                    Some(PartitionBy::Year) => format!(
+                        "{}/year={}/{}_{:04}.parquet",
+                        table.name,
+                        now.format("%Y"),
+                        now.format("%m%d_%H%M%S"),
+                        batch_num
+                    ),
+                    None => format!(
+                        "{}/{}_{:04}.parquet",
+                        table.name,
+                        now.format("%Y%m%d_%H%M%S"),
+                        batch_num
+                    ),
+                };
 
-        output::write_output(&config.output, &filename, buf).await?;
+                output::write_output(&config.output, &filename, buf).await?;
+            }
+            OutputFormat::Iceberg => {
+                iceberg_batches.push(batch);
+            }
+        }
 
-        // Persist incremental progress batch-by-batch so reruns can resume safely.
+        // Always advance in-memory cursor for next batch query.
         if let Some(ref wm) = new_watermark {
-            state.set_progress(&table_name, wm, new_cursor.as_deref())?;
             watermark_val = Some(wm.clone());
-            cursor_val = new_cursor;
-            tracing::debug!(table = %table_name, watermark = %wm, cursor = ?cursor_val, "checkpointed watermark");
+            cursor_val = new_cursor.clone();
+
+            // For Parquet we can checkpoint immediately after each successful file write.
+            if config.format == OutputFormat::Parquet {
+                state.set_progress(&table_name, wm, new_cursor.as_deref())?;
+                tracing::debug!(
+                    table = %table_name,
+                    watermark = %wm,
+                    cursor = ?cursor_val,
+                    "checkpointed watermark"
+                );
+            }
         }
 
         batch_num += 1;
@@ -320,6 +354,21 @@ async fn sync_table(
         // If we got fewer rows than batch_size, we're done
         if num_rows < config.batch_size {
             break;
+        }
+    }
+
+    // For Iceberg format, write all batches in a single commit
+    if config.format == OutputFormat::Iceberg && !iceberg_batches.is_empty() {
+        let catalog = iceberg_catalog.expect("iceberg catalog required for iceberg format");
+        iceberg_write::write_iceberg(catalog, &table_name, &iceberg_batches).await?;
+        if let Some(ref wm) = watermark_val {
+            state.set_progress(&table_name, wm, cursor_val.as_deref())?;
+            tracing::debug!(
+                table = %table_name,
+                watermark = %wm,
+                cursor = ?cursor_val,
+                "checkpointed watermark after iceberg commit"
+            );
         }
     }
 

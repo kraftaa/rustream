@@ -24,6 +24,18 @@ output:
 #   prefix: raw/postgres
 #   region: us-east-1
 
+# Output format: parquet (default) or iceberg
+# format: parquet
+
+# Iceberg output (uncomment to use instead of standalone Parquet)
+# Writes proper Iceberg table metadata so Spark, Trino, Athena can query it.
+# format: iceberg
+# warehouse: s3://my-bucket/warehouse   # or ./local_warehouse
+# catalog:
+#   type: filesystem                     # default, zero setup
+#   # type: glue                         # for Athena (requires --features glue)
+#   # glue_database: my_db              # required when type=glue
+
 # Batch size for reading rows from Postgres
 batch_size: 10000
 

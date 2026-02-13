@@ -1,4 +1,6 @@
+mod catalog;
 mod config;
+mod iceberg;
 mod output;
 mod reader;
 mod schema;
