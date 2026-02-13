@@ -16,6 +16,36 @@ pub struct Config {
     pub batch_size: usize,
     #[serde(default)]
     pub state_dir: Option<String>,
+    #[serde(default)]
+    pub format: OutputFormat,
+    #[serde(default)]
+    pub catalog: Option<CatalogConfig>,
+    #[serde(default)]
+    pub warehouse: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputFormat {
+    #[default]
+    Parquet,
+    Iceberg,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CatalogConfig {
+    #[serde(default = "default_catalog_type", rename = "type")]
+    pub catalog_type: CatalogType,
+    #[serde(default)]
+    pub glue_database: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogType {
+    #[default]
+    Filesystem,
+    Glue,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -102,11 +132,28 @@ fn default_batch_size() -> usize {
     10_000
 }
 
+fn default_catalog_type() -> CatalogType {
+    CatalogType::Filesystem
+}
+
 pub fn load(path: &str) -> Result<Config> {
     let content = std::fs::read_to_string(Path::new(path))
         .with_context(|| format!("reading config from {path}"))?;
     let config: Config =
         serde_yaml::from_str(&content).with_context(|| format!("parsing config from {path}"))?;
+
+    // Validate: iceberg format requires a warehouse path
+    if config.format == OutputFormat::Iceberg && config.warehouse.is_none() {
+        anyhow::bail!("'warehouse' is required when format is 'iceberg'");
+    }
+
+    // Validate: glue catalog requires glue_database
+    if let Some(ref cat) = config.catalog {
+        if matches!(cat.catalog_type, CatalogType::Glue) && cat.glue_database.is_none() {
+            anyhow::bail!("'glue_database' is required when catalog type is 'glue'");
+        }
+    }
+
     Ok(config)
 }
 

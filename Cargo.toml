@@ -17,9 +17,9 @@ tokio = { version = "1", features = ["full"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
 postgres-types = { version = "0.2", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
 
-# Arrow / Parquet
-arrow = { version = "53", features = ["chrono-tz"] }
-parquet = { version = "53", features = ["arrow"] }
+# Arrow / Parquet (v57 to match iceberg 0.8)
+arrow = { version = "57", features = ["chrono-tz"] }
+parquet = { version = "57", features = ["arrow"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -39,11 +39,23 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Iceberg
+iceberg = "0.8"
+iceberg-catalog-rest = "0.8"
+
 # Utils
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["serde"] }
 anyhow = "1"
 serde_json = "1"
+
+[features]
+default = []
+glue = ["iceberg-catalog-glue"]
+
+[dependencies.iceberg-catalog-glue]
+version = "0.8"
+optional = true
 
 [dev-dependencies]
 bytes = "1"
