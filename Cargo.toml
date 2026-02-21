@@ -48,6 +48,9 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["serde"] }
 anyhow = "1"
 serde_json = "1"
+bytes = "1"
+glob = "0.3"
+arrow-csv = "57"
 
 [features]
 default = []
@@ -58,4 +61,4 @@ version = "0.8"
 optional = true
 
 [dev-dependencies]
-bytes = "1"
+tempfile = "3"

@@ -1,7 +1,10 @@
 mod catalog;
 mod config;
 mod iceberg;
+mod ingest;
+mod input;
 mod output;
+mod pg_writer;
 mod reader;
 mod schema;
 mod state;
@@ -32,6 +35,17 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Ingest Parquet/CSV files from local filesystem or S3 into Postgres
+    Ingest {
+        /// Path to config YAML file
+        #[arg(short, long)]
+        config: String,
+
+        /// Show what would be ingested without actually doing it
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -52,6 +66,17 @@ async fn main() -> Result<()> {
                 sync::dry_run(cfg).await?;
             } else {
                 sync::run(cfg).await?;
+            }
+        }
+        Commands::Ingest {
+            config: config_path,
+            dry_run,
+        } => {
+            let cfg = config::load(&config_path)?;
+            if dry_run {
+                ingest::dry_run(cfg).await?;
+            } else {
+                ingest::run(cfg).await?;
             }
         }
     }

@@ -14,7 +14,7 @@ use crate::schema::{self, ColumnInfo};
 use crate::state::StateStore;
 use crate::writer;
 
-async fn connect(config: &Config) -> Result<tokio_postgres::Client> {
+pub(crate) async fn connect(config: &Config) -> Result<tokio_postgres::Client> {
     let conn_str = config.postgres.connection_string();
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
@@ -105,7 +105,13 @@ pub async fn dry_run(config: Config) -> Result<()> {
         }
     }
 
-    println!("\nOutput: {:?}", config.output);
+    println!(
+        "\nOutput: {:?}",
+        config
+            .output
+            .as_ref()
+            .expect("output config required for sync")
+    );
 
     Ok(())
 }
@@ -325,7 +331,11 @@ async fn sync_table(
                     ),
                 };
 
-                output::write_output(&config.output, &filename, buf).await?;
+                let output = config
+                    .output
+                    .as_ref()
+                    .expect("output config required for sync");
+                output::write_output(output, &filename, buf).await?;
             }
             OutputFormat::Iceberg => {
                 iceberg_batches.push(batch);
