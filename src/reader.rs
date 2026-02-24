@@ -15,7 +15,9 @@ pub fn build_query(
     table: &TableConfig,
     columns: &[ColumnInfo],
     watermark_col: Option<&str>,
+    cursor_col: Option<&str>,
     watermark_val: Option<&str>,
+    cursor_val: Option<&str>,
     batch_size: usize,
 ) -> String {
     let cols = columns
@@ -27,12 +29,22 @@ pub fn build_query(
     let full_name = table.full_name();
     let mut query = format!("SELECT {cols} FROM {full_name}");
 
-    if let (Some(col), Some(val)) = (watermark_col, watermark_val) {
-        query.push_str(&format!(" WHERE \"{col}\" > '{val}'"));
+    if let (Some(wm_col), Some(_)) = (watermark_col, watermark_val) {
+        if let (Some(cur_col), Some(_)) = (cursor_col, cursor_val) {
+            query.push_str(&format!(
+                " WHERE (\"{wm_col}\" > $1 OR (\"{wm_col}\" = $1 AND \"{cur_col}\" > $2))"
+            ));
+        } else {
+            query.push_str(&format!(" WHERE \"{wm_col}\" > $1"));
+        }
     }
 
-    if let Some(col) = watermark_col {
-        query.push_str(&format!(" ORDER BY \"{col}\" ASC"));
+    if let Some(wm_col) = watermark_col {
+        if let Some(cur_col) = cursor_col {
+            query.push_str(&format!(" ORDER BY \"{wm_col}\" ASC, \"{cur_col}\" ASC"));
+        } else {
+            query.push_str(&format!(" ORDER BY \"{wm_col}\" ASC"));
+        }
     }
 
     query.push_str(&format!(" LIMIT {batch_size}"));
@@ -46,17 +58,37 @@ pub async fn read_batch(
     columns: &[ColumnInfo],
     schema: &Arc<Schema>,
     watermark_col: Option<&str>,
+    cursor_col: Option<&str>,
     watermark_val: Option<&str>,
+    cursor_val: Option<&str>,
     batch_size: usize,
 ) -> Result<Option<RecordBatch>> {
-    let query = build_query(table, columns, watermark_col, watermark_val, batch_size);
+    let query = build_query(
+        table,
+        columns,
+        watermark_col,
+        cursor_col,
+        watermark_val,
+        cursor_val,
+        batch_size,
+    );
 
     tracing::debug!(%query, "executing query");
 
-    let rows = client
-        .query(&query as &str, &[])
-        .await
-        .with_context(|| format!("querying table {}", table.full_name()))?;
+    let rows = match (watermark_val, cursor_val) {
+        (Some(wm), Some(cur)) if cursor_col.is_some() => client
+            .query(&query as &str, &[&wm, &cur])
+            .await
+            .with_context(|| format!("querying table {}", table.full_name()))?,
+        (Some(wm), _) => client
+            .query(&query as &str, &[&wm])
+            .await
+            .with_context(|| format!("querying table {}", table.full_name()))?,
+        (None, _) => client
+            .query(&query as &str, &[])
+            .await
+            .with_context(|| format!("querying table {}", table.full_name()))?,
+    };
 
     if rows.is_empty() {
         return Ok(None);
@@ -177,6 +209,8 @@ mod tests {
             schema: None,
             columns: None,
             incremental_column: None,
+            incremental_tiebreaker_column: None,
+            incremental_column_is_unique: false,
             partition_by: None,
         }
     }
@@ -208,7 +242,7 @@ mod tests {
     fn build_query_full_table() {
         let table = make_table("users");
         let cols = make_columns();
-        let q = build_query(&table, &cols, None, None, 1000);
+        let q = build_query(&table, &cols, None, None, None, None, 1000);
         assert_eq!(
             q,
             "SELECT \"id\", \"name\", \"updated_at\" FROM users LIMIT 1000"
@@ -222,10 +256,12 @@ mod tests {
             schema: Some("analytics".into()),
             columns: None,
             incremental_column: None,
+            incremental_tiebreaker_column: None,
+            incremental_column_is_unique: false,
             partition_by: None,
         };
         let cols = make_columns();
-        let q = build_query(&table, &cols, None, None, 500);
+        let q = build_query(&table, &cols, None, None, None, None, 500);
         assert_eq!(
             q,
             "SELECT \"id\", \"name\", \"updated_at\" FROM analytics.users LIMIT 500"
@@ -236,7 +272,7 @@ mod tests {
     fn build_query_with_watermark_no_value() {
         let table = make_table("users");
         let cols = make_columns();
-        let q = build_query(&table, &cols, Some("updated_at"), None, 1000);
+        let q = build_query(&table, &cols, Some("updated_at"), None, None, None, 1000);
         assert_eq!(
             q,
             "SELECT \"id\", \"name\", \"updated_at\" FROM users ORDER BY \"updated_at\" ASC LIMIT 1000"
@@ -251,11 +287,31 @@ mod tests {
             &table,
             &cols,
             Some("updated_at"),
+            None,
             Some("2026-01-01 00:00:00"),
+            None,
             1000,
         );
-        assert!(q.contains("WHERE \"updated_at\" > '2026-01-01 00:00:00'"));
+        assert!(q.contains("WHERE \"updated_at\" > $1"));
         assert!(q.contains("ORDER BY \"updated_at\" ASC"));
+        assert!(q.ends_with("LIMIT 1000"));
+    }
+
+    #[test]
+    fn build_query_with_watermark_and_cursor() {
+        let table = make_table("users");
+        let cols = make_columns();
+        let q = build_query(
+            &table,
+            &cols,
+            Some("updated_at"),
+            Some("id"),
+            Some("2026-01-01 00:00:00"),
+            Some("100"),
+            1000,
+        );
+        assert!(q.contains("WHERE (\"updated_at\" > $1 OR (\"updated_at\" = $1 AND \"id\" > $2))"));
+        assert!(q.contains("ORDER BY \"updated_at\" ASC, \"id\" ASC"));
         assert!(q.ends_with("LIMIT 1000"));
     }
 }

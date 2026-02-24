@@ -21,10 +21,33 @@ impl StateStore {
             "CREATE TABLE IF NOT EXISTS watermarks (
                 table_name TEXT PRIMARY KEY,
                 watermark_value TEXT NOT NULL,
+                cursor_value TEXT,
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )",
         )
         .context("creating watermarks table")?;
+
+        // Backward-compatible migration for existing state DBs.
+        let has_cursor_col = conn
+            .prepare("PRAGMA table_info(watermarks)")
+            .and_then(|mut stmt| {
+                let mut rows = stmt.query([])?;
+                let mut found = false;
+                while let Some(row) = rows.next()? {
+                    let col_name: String = row.get(1)?;
+                    if col_name == "cursor_value" {
+                        found = true;
+                        break;
+                    }
+                }
+                Ok(found)
+            })
+            .context("checking watermarks schema")?;
+
+        if !has_cursor_col {
+            conn.execute("ALTER TABLE watermarks ADD COLUMN cursor_value TEXT", [])
+                .context("adding cursor_value column to watermarks")?;
+        }
 
         Ok(Self { conn })
     }
@@ -43,14 +66,43 @@ impl StateStore {
 
     /// Set the high watermark for a table.
     pub fn set_watermark(&self, table_name: &str, value: &str) -> Result<()> {
+        self.set_progress(table_name, value, None)
+    }
+
+    /// Get high watermark and cursor for a table.
+    pub fn get_progress(&self, table_name: &str) -> Result<Option<(String, Option<String>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT watermark_value, cursor_value FROM watermarks WHERE table_name = ?1")
+            .context("preparing progress select")?;
+
+        let result = stmt
+            .query_row([table_name], |row| {
+                let wm: String = row.get(0)?;
+                let cursor: Option<String> = row.get(1)?;
+                Ok((wm, cursor))
+            })
+            .ok();
+
+        Ok(result)
+    }
+
+    /// Set high watermark and cursor for a table.
+    pub fn set_progress(
+        &self,
+        table_name: &str,
+        watermark_value: &str,
+        cursor_value: Option<&str>,
+    ) -> Result<()> {
         self.conn
             .execute(
-                "INSERT INTO watermarks (table_name, watermark_value, updated_at)
-                 VALUES (?1, ?2, datetime('now'))
+                "INSERT INTO watermarks (table_name, watermark_value, cursor_value, updated_at)
+                 VALUES (?1, ?2, ?3, datetime('now'))
                  ON CONFLICT(table_name) DO UPDATE SET
                     watermark_value = excluded.watermark_value,
+                    cursor_value = excluded.cursor_value,
                     updated_at = excluded.updated_at",
-                [table_name, value],
+                (table_name, watermark_value, cursor_value),
             )
             .with_context(|| format!("setting watermark for {table_name}"))?;
 
@@ -156,6 +208,23 @@ mod tests {
                 Some("persisted")
             );
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_and_get_progress() {
+        let dir = temp_state_dir();
+        let store = StateStore::open(&dir).unwrap();
+
+        store
+            .set_progress("users", "2026-01-15 10:30:00", Some("42"))
+            .unwrap();
+
+        assert_eq!(
+            store.get_progress("users").unwrap(),
+            Some(("2026-01-15 10:30:00".to_string(), Some("42".to_string())))
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -53,6 +53,10 @@ pub struct TableConfig {
     #[serde(default)]
     pub incremental_column: Option<String>,
     #[serde(default)]
+    pub incremental_tiebreaker_column: Option<String>,
+    #[serde(default)]
+    pub incremental_column_is_unique: bool,
+    #[serde(default)]
     pub partition_by: Option<PartitionBy>,
 }
 
@@ -156,6 +160,8 @@ state_dir: /tmp/state
 tables:
   - name: users
     incremental_column: updated_at
+    incremental_tiebreaker_column: id
+    incremental_column_is_unique: false
     columns:
       - id
       - email
@@ -175,6 +181,8 @@ exclude:
         assert_eq!(tables.len(), 2);
         assert_eq!(tables[0].name, "users");
         assert_eq!(tables[0].incremental_column.as_deref(), Some("updated_at"));
+        assert_eq!(tables[0].incremental_tiebreaker_column.as_deref(), Some("id"));
+        assert!(!tables[0].incremental_column_is_unique);
         assert_eq!(tables[0].columns.as_ref().unwrap().len(), 2);
         assert!(matches!(tables[1].partition_by, Some(PartitionBy::Date)));
 
@@ -231,6 +239,8 @@ exclude:
             schema: Some("analytics".into()),
             columns: None,
             incremental_column: None,
+            incremental_tiebreaker_column: None,
+            incremental_column_is_unique: false,
             partition_by: None,
         };
         assert_eq!(t.full_name(), "analytics.users");
@@ -244,6 +254,8 @@ exclude:
             schema: None,
             columns: None,
             incremental_column: None,
+            incremental_tiebreaker_column: None,
+            incremental_column_is_unique: false,
             partition_by: None,
         };
         assert_eq!(t.full_name(), "orders");

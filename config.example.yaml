@@ -34,6 +34,7 @@ state_dir: .rustream_state
 tables:
   - name: users
     incremental_column: updated_at
+    incremental_tiebreaker_column: id
     columns:              # optional: pick specific columns
       - id
       - email
@@ -43,11 +44,17 @@ tables:
 
   - name: orders
     incremental_column: updated_at
+    incremental_tiebreaker_column: id
     partition_by: date      # table/year=2026/month=02/day=10/...
     # partition_by: month   # table/year=2026/month=02/...
     # partition_by: year    # table/year=2026/...
 
   - name: products        # no incremental_column = full sync every run
+
+  # Example for append-only tables without updated_at:
+  # - name: events
+  #   incremental_column: id
+  #   incremental_column_is_unique: true
 
 # Option 2: Auto-discover all tables (remove `tables` above and uncomment below)
 # schema: public          # which schema to discover from (default: public)
