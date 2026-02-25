@@ -66,6 +66,7 @@ output:
 tables:
   - name: users
     incremental_column: updated_at
+    incremental_tiebreaker_column: id
     columns:          # optional: pick specific columns
       - id
       - email
@@ -74,8 +75,13 @@ tables:
 
   - name: orders
     incremental_column: updated_at
+    incremental_tiebreaker_column: id
 
   - name: products    # no incremental_column = full sync every run
+
+  - name: events      # append-only example (no updated_at)
+    incremental_column: id
+    incremental_column_is_unique: true
 ```
 
 ### All tables (auto-discover)
@@ -132,6 +138,8 @@ AWS credentials come from environment variables, `~/.aws/credentials`, or IAM ro
 | `tables[].schema` | Schema name (default: `public`) |
 | `tables[].columns` | Columns to sync (default: all) |
 | `tables[].incremental_column` | Column for watermark-based incremental sync |
+| `tables[].incremental_tiebreaker_column` | Stable cursor column for duplicate-safe incremental paging (required when `incremental_column` is set; recommended: primary key) |
+| `tables[].incremental_column_is_unique` | Allow watermark-only incremental mode when incremental column is strictly unique/monotonic (e.g. append-only `id`) |
 | `tables[].partition_by` | Partition output files: `date`, `month`, or `year` |
 
 ## How it works
@@ -140,8 +148,9 @@ AWS credentials come from environment variables, `~/.aws/credentials`, or IAM ro
 2. Maps Postgres column types to Arrow types automatically
 3. Reads rows in batches, converting to Arrow RecordBatches
 4. Writes each batch as a Snappy-compressed Parquet file
-5. Tracks the high watermark (max value of `incremental_column`) in local SQLite
-6. On next run, only reads rows where `incremental_column > last_watermark`
+5. Tracks the high watermark (max value of `incremental_column`) and optional cursor in local SQLite
+6. Checkpoints incremental progress after each successfully written batch
+7. On next run, reads rows after the saved `(watermark, cursor)` position
 
 Tables without `incremental_column` do a full sync every run.
 

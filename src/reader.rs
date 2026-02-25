@@ -10,12 +10,22 @@ use tokio_postgres::{Client, Row};
 use crate::config::TableConfig;
 use crate::schema::ColumnInfo;
 
+pub struct ReadBatchOptions<'a> {
+    pub watermark_col: Option<&'a str>,
+    pub cursor_col: Option<&'a str>,
+    pub watermark_val: Option<&'a str>,
+    pub cursor_val: Option<&'a str>,
+    pub batch_size: usize,
+}
+
 /// Build the SELECT query for a table, optionally filtering by watermark.
 pub fn build_query(
     table: &TableConfig,
     columns: &[ColumnInfo],
     watermark_col: Option<&str>,
+    cursor_col: Option<&str>,
     watermark_val: Option<&str>,
+    cursor_val: Option<&str>,
     batch_size: usize,
 ) -> String {
     let cols = columns
@@ -27,12 +37,22 @@ pub fn build_query(
     let full_name = table.full_name();
     let mut query = format!("SELECT {cols} FROM {full_name}");
 
-    if let (Some(col), Some(val)) = (watermark_col, watermark_val) {
-        query.push_str(&format!(" WHERE \"{col}\" > '{val}'"));
+    if let (Some(wm_col), Some(_)) = (watermark_col, watermark_val) {
+        if let (Some(cur_col), Some(_)) = (cursor_col, cursor_val) {
+            query.push_str(&format!(
+                " WHERE (\"{wm_col}\" > $1 OR (\"{wm_col}\" = $1 AND \"{cur_col}\" > $2))"
+            ));
+        } else {
+            query.push_str(&format!(" WHERE \"{wm_col}\" > $1"));
+        }
     }
 
-    if let Some(col) = watermark_col {
-        query.push_str(&format!(" ORDER BY \"{col}\" ASC"));
+    if let Some(wm_col) = watermark_col {
+        if let Some(cur_col) = cursor_col {
+            query.push_str(&format!(" ORDER BY \"{wm_col}\" ASC, \"{cur_col}\" ASC"));
+        } else {
+            query.push_str(&format!(" ORDER BY \"{wm_col}\" ASC"));
+        }
     }
 
     query.push_str(&format!(" LIMIT {batch_size}"));
@@ -45,18 +65,34 @@ pub async fn read_batch(
     table: &TableConfig,
     columns: &[ColumnInfo],
     schema: &Arc<Schema>,
-    watermark_col: Option<&str>,
-    watermark_val: Option<&str>,
-    batch_size: usize,
+    options: ReadBatchOptions<'_>,
 ) -> Result<Option<RecordBatch>> {
-    let query = build_query(table, columns, watermark_col, watermark_val, batch_size);
+    let query = build_query(
+        table,
+        columns,
+        options.watermark_col,
+        options.cursor_col,
+        options.watermark_val,
+        options.cursor_val,
+        options.batch_size,
+    );
 
     tracing::debug!(%query, "executing query");
 
-    let rows = client
-        .query(&query as &str, &[])
-        .await
-        .with_context(|| format!("querying table {}", table.full_name()))?;
+    let rows = match (options.watermark_val, options.cursor_val) {
+        (Some(wm), Some(cur)) if options.cursor_col.is_some() => client
+            .query(&query as &str, &[&wm, &cur])
+            .await
+            .with_context(|| format!("querying table {}", table.full_name()))?,
+        (Some(wm), _) => client
+            .query(&query as &str, &[&wm])
+            .await
+            .with_context(|| format!("querying table {}", table.full_name()))?,
+        (None, _) => client
+            .query(&query as &str, &[])
+            .await
+            .with_context(|| format!("querying table {}", table.full_name()))?,
+    };
 
     if rows.is_empty() {
         return Ok(None);
@@ -167,6 +203,37 @@ fn rows_to_array(rows: &[Row], col_idx: usize, arrow_type: &DataType) -> Result<
     }
 }
 
+/// Try to get a PG column value as a String, handling various types.
+fn get_as_string(row: &Row, idx: usize) -> Option<String> {
+    let col_type = row.columns()[idx].type_();
+
+    match *col_type {
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => row.get::<_, Option<String>>(idx),
+        Type::UUID => row.get::<_, Option<uuid::Uuid>>(idx).map(|u| u.to_string()),
+        Type::JSON | Type::JSONB => row
+            .get::<_, Option<serde_json::Value>>(idx)
+            .map(|v| v.to_string()),
+        Type::NUMERIC => row.get::<_, Option<String>>(idx),
+        Type::TIMESTAMP => row
+            .get::<_, Option<NaiveDateTime>>(idx)
+            .map(|dt| dt.to_string()),
+        Type::TIMESTAMPTZ => row
+            .get::<_, Option<chrono::DateTime<chrono::Utc>>>(idx)
+            .map(|dt| dt.to_rfc3339()),
+        Type::DATE => row.get::<_, Option<NaiveDate>>(idx).map(|d| d.to_string()),
+        Type::INT4 => row.get::<_, Option<i32>>(idx).map(|v| v.to_string()),
+        Type::INT8 => row.get::<_, Option<i64>>(idx).map(|v| v.to_string()),
+        Type::INT2 => row.get::<_, Option<i16>>(idx).map(|v| v.to_string()),
+        Type::FLOAT4 => row.get::<_, Option<f32>>(idx).map(|v| v.to_string()),
+        Type::FLOAT8 => row.get::<_, Option<f64>>(idx).map(|v| v.to_string()),
+        Type::BOOL => row.get::<_, Option<bool>>(idx).map(|v| v.to_string()),
+        _ => {
+            // Last resort: try as String
+            row.try_get::<_, Option<String>>(idx).unwrap_or(None)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +244,8 @@ mod tests {
             schema: None,
             columns: None,
             incremental_column: None,
+            incremental_tiebreaker_column: None,
+            incremental_column_is_unique: false,
             partition_by: None,
         }
     }
@@ -208,7 +277,7 @@ mod tests {
     fn build_query_full_table() {
         let table = make_table("users");
         let cols = make_columns();
-        let q = build_query(&table, &cols, None, None, 1000);
+        let q = build_query(&table, &cols, None, None, None, None, 1000);
         assert_eq!(
             q,
             "SELECT \"id\", \"name\", \"updated_at\" FROM users LIMIT 1000"
@@ -222,10 +291,12 @@ mod tests {
             schema: Some("analytics".into()),
             columns: None,
             incremental_column: None,
+            incremental_tiebreaker_column: None,
+            incremental_column_is_unique: false,
             partition_by: None,
         };
         let cols = make_columns();
-        let q = build_query(&table, &cols, None, None, 500);
+        let q = build_query(&table, &cols, None, None, None, None, 500);
         assert_eq!(
             q,
             "SELECT \"id\", \"name\", \"updated_at\" FROM analytics.users LIMIT 500"
@@ -236,7 +307,7 @@ mod tests {
     fn build_query_with_watermark_no_value() {
         let table = make_table("users");
         let cols = make_columns();
-        let q = build_query(&table, &cols, Some("updated_at"), None, 1000);
+        let q = build_query(&table, &cols, Some("updated_at"), None, None, None, 1000);
         assert_eq!(
             q,
             "SELECT \"id\", \"name\", \"updated_at\" FROM users ORDER BY \"updated_at\" ASC LIMIT 1000"
@@ -251,42 +322,31 @@ mod tests {
             &table,
             &cols,
             Some("updated_at"),
+            None,
             Some("2026-01-01 00:00:00"),
+            None,
             1000,
         );
-        assert!(q.contains("WHERE \"updated_at\" > '2026-01-01 00:00:00'"));
+        assert!(q.contains("WHERE \"updated_at\" > $1"));
         assert!(q.contains("ORDER BY \"updated_at\" ASC"));
         assert!(q.ends_with("LIMIT 1000"));
     }
-}
 
-/// Try to get a PG column value as a String, handling various types.
-fn get_as_string(row: &Row, idx: usize) -> Option<String> {
-    let col_type = row.columns()[idx].type_();
-
-    match *col_type {
-        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => row.get::<_, Option<String>>(idx),
-        Type::UUID => row.get::<_, Option<uuid::Uuid>>(idx).map(|u| u.to_string()),
-        Type::JSON | Type::JSONB => row
-            .get::<_, Option<serde_json::Value>>(idx)
-            .map(|v| v.to_string()),
-        Type::NUMERIC => row.get::<_, Option<String>>(idx),
-        Type::TIMESTAMP => row
-            .get::<_, Option<NaiveDateTime>>(idx)
-            .map(|dt| dt.to_string()),
-        Type::TIMESTAMPTZ => row
-            .get::<_, Option<chrono::DateTime<chrono::Utc>>>(idx)
-            .map(|dt| dt.to_rfc3339()),
-        Type::DATE => row.get::<_, Option<NaiveDate>>(idx).map(|d| d.to_string()),
-        Type::INT4 => row.get::<_, Option<i32>>(idx).map(|v| v.to_string()),
-        Type::INT8 => row.get::<_, Option<i64>>(idx).map(|v| v.to_string()),
-        Type::INT2 => row.get::<_, Option<i16>>(idx).map(|v| v.to_string()),
-        Type::FLOAT4 => row.get::<_, Option<f32>>(idx).map(|v| v.to_string()),
-        Type::FLOAT8 => row.get::<_, Option<f64>>(idx).map(|v| v.to_string()),
-        Type::BOOL => row.get::<_, Option<bool>>(idx).map(|v| v.to_string()),
-        _ => {
-            // Last resort: try as String
-            row.try_get::<_, Option<String>>(idx).unwrap_or(None)
-        }
+    #[test]
+    fn build_query_with_watermark_and_cursor() {
+        let table = make_table("users");
+        let cols = make_columns();
+        let q = build_query(
+            &table,
+            &cols,
+            Some("updated_at"),
+            Some("id"),
+            Some("2026-01-01 00:00:00"),
+            Some("100"),
+            1000,
+        );
+        assert!(q.contains("WHERE (\"updated_at\" > $1 OR (\"updated_at\" = $1 AND \"id\" > $2))"));
+        assert!(q.contains("ORDER BY \"updated_at\" ASC, \"id\" ASC"));
+        assert!(q.ends_with("LIMIT 1000"));
     }
 }

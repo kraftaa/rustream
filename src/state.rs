@@ -21,36 +21,71 @@ impl StateStore {
             "CREATE TABLE IF NOT EXISTS watermarks (
                 table_name TEXT PRIMARY KEY,
                 watermark_value TEXT NOT NULL,
+                cursor_value TEXT,
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )",
         )
         .context("creating watermarks table")?;
 
+        // Backward-compatible migration for existing state DBs.
+        let has_cursor_col = conn
+            .prepare("PRAGMA table_info(watermarks)")
+            .and_then(|mut stmt| {
+                let mut rows = stmt.query([])?;
+                let mut found = false;
+                while let Some(row) = rows.next()? {
+                    let col_name: String = row.get(1)?;
+                    if col_name == "cursor_value" {
+                        found = true;
+                        break;
+                    }
+                }
+                Ok(found)
+            })
+            .context("checking watermarks schema")?;
+
+        if !has_cursor_col {
+            conn.execute("ALTER TABLE watermarks ADD COLUMN cursor_value TEXT", [])
+                .context("adding cursor_value column to watermarks")?;
+        }
+
         Ok(Self { conn })
     }
 
-    /// Get the high watermark for a table.
-    pub fn get_watermark(&self, table_name: &str) -> Result<Option<String>> {
+    /// Get high watermark and cursor for a table.
+    pub fn get_progress(&self, table_name: &str) -> Result<Option<(String, Option<String>)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT watermark_value FROM watermarks WHERE table_name = ?1")
-            .context("preparing watermark select")?;
+            .prepare("SELECT watermark_value, cursor_value FROM watermarks WHERE table_name = ?1")
+            .context("preparing progress select")?;
 
-        let result = stmt.query_row([table_name], |row| row.get(0)).ok();
+        let result = stmt
+            .query_row([table_name], |row| {
+                let wm: String = row.get(0)?;
+                let cursor: Option<String> = row.get(1)?;
+                Ok((wm, cursor))
+            })
+            .ok();
 
         Ok(result)
     }
 
-    /// Set the high watermark for a table.
-    pub fn set_watermark(&self, table_name: &str, value: &str) -> Result<()> {
+    /// Set high watermark and cursor for a table.
+    pub fn set_progress(
+        &self,
+        table_name: &str,
+        watermark_value: &str,
+        cursor_value: Option<&str>,
+    ) -> Result<()> {
         self.conn
             .execute(
-                "INSERT INTO watermarks (table_name, watermark_value, updated_at)
-                 VALUES (?1, ?2, datetime('now'))
+                "INSERT INTO watermarks (table_name, watermark_value, cursor_value, updated_at)
+                 VALUES (?1, ?2, ?3, datetime('now'))
                  ON CONFLICT(table_name) DO UPDATE SET
                     watermark_value = excluded.watermark_value,
+                    cursor_value = excluded.cursor_value,
                     updated_at = excluded.updated_at",
-                [table_name, value],
+                (table_name, watermark_value, cursor_value),
             )
             .with_context(|| format!("setting watermark for {table_name}"))?;
 
@@ -83,22 +118,24 @@ mod tests {
     }
 
     #[test]
-    fn get_watermark_returns_none_initially() {
+    fn get_progress_returns_none_initially() {
         let dir = temp_state_dir();
         let store = StateStore::open(&dir).unwrap();
-        assert_eq!(store.get_watermark("users").unwrap(), None);
+        assert_eq!(store.get_progress("users").unwrap(), None);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn set_and_get_watermark() {
+    fn set_and_get_watermark_without_cursor() {
         let dir = temp_state_dir();
         let store = StateStore::open(&dir).unwrap();
 
-        store.set_watermark("users", "2026-01-15 10:30:00").unwrap();
+        store
+            .set_progress("users", "2026-01-15 10:30:00", None)
+            .unwrap();
         assert_eq!(
-            store.get_watermark("users").unwrap().as_deref(),
-            Some("2026-01-15 10:30:00")
+            store.get_progress("users").unwrap(),
+            Some(("2026-01-15 10:30:00".to_string(), None))
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -109,14 +146,14 @@ mod tests {
         let store = StateStore::open(&dir).unwrap();
 
         store
-            .set_watermark("orders", "2026-01-01 00:00:00")
+            .set_progress("orders", "2026-01-01 00:00:00", None)
             .unwrap();
         store
-            .set_watermark("orders", "2026-02-01 00:00:00")
+            .set_progress("orders", "2026-02-01 00:00:00", None)
             .unwrap();
         assert_eq!(
-            store.get_watermark("orders").unwrap().as_deref(),
-            Some("2026-02-01 00:00:00")
+            store.get_progress("orders").unwrap(),
+            Some(("2026-02-01 00:00:00".to_string(), None))
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -126,16 +163,16 @@ mod tests {
         let dir = temp_state_dir();
         let store = StateStore::open(&dir).unwrap();
 
-        store.set_watermark("users", "aaa").unwrap();
-        store.set_watermark("orders", "bbb").unwrap();
+        store.set_progress("users", "aaa", None).unwrap();
+        store.set_progress("orders", "bbb", None).unwrap();
 
         assert_eq!(
-            store.get_watermark("users").unwrap().as_deref(),
-            Some("aaa")
+            store.get_progress("users").unwrap(),
+            Some(("aaa".to_string(), None))
         );
         assert_eq!(
-            store.get_watermark("orders").unwrap().as_deref(),
-            Some("bbb")
+            store.get_progress("orders").unwrap(),
+            Some(("bbb".to_string(), None))
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -146,16 +183,33 @@ mod tests {
 
         {
             let store = StateStore::open(&dir).unwrap();
-            store.set_watermark("users", "persisted").unwrap();
+            store.set_progress("users", "persisted", None).unwrap();
         }
 
         {
             let store = StateStore::open(&dir).unwrap();
             assert_eq!(
-                store.get_watermark("users").unwrap().as_deref(),
-                Some("persisted")
+                store.get_progress("users").unwrap(),
+                Some(("persisted".to_string(), None))
             );
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_and_get_progress() {
+        let dir = temp_state_dir();
+        let store = StateStore::open(&dir).unwrap();
+
+        store
+            .set_progress("users", "2026-01-15 10:30:00", Some("42"))
+            .unwrap();
+
+        assert_eq!(
+            store.get_progress("users").unwrap(),
+            Some(("2026-01-15 10:30:00".to_string(), Some("42".to_string())))
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

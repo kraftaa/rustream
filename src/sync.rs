@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use tokio_postgres::NoTls;
 
@@ -48,6 +48,8 @@ async fn resolve_tables(
                     schema: Some(config.schema.clone()),
                     columns: None,
                     incremental_column: None,
+                    incremental_tiebreaker_column: None,
+                    incremental_column_is_unique: false,
                     partition_by: None,
                 })
                 .collect();
@@ -67,7 +69,13 @@ pub async fn dry_run(config: Config) -> Result<()> {
         let columns = schema::introspect_table(&client, table).await?;
         let col_names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
         let mode = if table.incremental_column.is_some() {
-            "incremental"
+            if table.incremental_tiebreaker_column.is_some() {
+                "incremental (cursor)"
+            } else if table.incremental_column_is_unique {
+                "incremental (unique watermark)"
+            } else {
+                "incremental (invalid config: missing tiebreaker)"
+            }
         } else {
             "full"
         };
@@ -145,9 +153,69 @@ async fn sync_table(
 
     // Get watermark info
     let watermark_col = table.incremental_column.as_deref();
-    let mut watermark_val = match watermark_col {
-        Some(_) => state.get_watermark(&table_name)?,
-        None => None,
+    let cursor_col = watermark_col.and(table.incremental_tiebreaker_column.as_deref());
+
+    if watermark_col.is_some() && cursor_col.is_none() && !table.incremental_column_is_unique {
+        return Err(anyhow!(
+            "incremental_tiebreaker_column is required for incremental table {} unless incremental_column_is_unique=true",
+            table_name
+        ));
+    }
+
+    if let (Some(wm), Some(cur)) = (watermark_col, cursor_col) {
+        if wm == cur {
+            return Err(anyhow!(
+                "incremental_tiebreaker_column '{}' cannot equal incremental_column '{}' for table {}",
+                cur,
+                wm,
+                table_name
+            ));
+        }
+    }
+
+    if let Some(wm) = watermark_col {
+        if !columns.iter().any(|c| c.name == wm) {
+            return Err(anyhow!(
+                "incremental_column '{}' is not in selected columns for table {}",
+                wm,
+                table_name
+            ));
+        }
+    }
+    if let Some(cur) = cursor_col {
+        if !columns.iter().any(|c| c.name == cur) {
+            return Err(anyhow!(
+                "incremental_tiebreaker_column '{}' is not in selected columns for table {}",
+                cur,
+                table_name
+            ));
+        }
+    }
+
+    if let (Some(wm), Some(cur)) = (watermark_col, cursor_col) {
+        tracing::info!(table = %table_name, watermark_col = %wm, cursor_col = %cur, "incremental cursor enabled");
+    } else if let Some(wm) = watermark_col {
+        tracing::info!(
+            table = %table_name,
+            watermark_col = %wm,
+            "incremental watermark-only mode enabled (column marked unique)"
+        );
+    }
+
+    let (mut watermark_val, mut cursor_val) = match watermark_col {
+        Some(_) => match state.get_progress(&table_name)? {
+            Some((wm, cursor)) => {
+                if cursor_col.is_some() && cursor.is_none() {
+                    return Err(anyhow!(
+                        "state for table {} has watermark but no cursor; reset this table state and rerun",
+                        table_name
+                    ));
+                }
+                (Some(wm), cursor)
+            }
+            None => (None, None),
+        },
+        None => (None, None),
     };
 
     let mut total_rows = 0u64;
@@ -159,9 +227,13 @@ async fn sync_table(
             table,
             &columns,
             &arrow_schema,
-            watermark_col,
-            watermark_val.as_deref(),
-            config.batch_size,
+            reader::ReadBatchOptions {
+                watermark_col,
+                cursor_col,
+                watermark_val: watermark_val.as_deref(),
+                cursor_val: cursor_val.as_deref(),
+                batch_size: config.batch_size,
+            },
         )
         .await?;
 
@@ -173,12 +245,26 @@ async fn sync_table(
         let num_rows = batch.num_rows();
         total_rows += num_rows as u64;
 
-        // Update watermark from the last row
-        if let Some(col) = watermark_col {
-            if let Some(new_wm) = extract_watermark(&columns, &batch, col) {
-                watermark_val = Some(new_wm);
-            }
-        }
+        let new_watermark = match watermark_col {
+            Some(col) => Some(extract_watermark(&columns, &batch, col).ok_or_else(|| {
+                anyhow!(
+                    "incremental column '{}' produced no watermark value for table {}",
+                    col,
+                    table_name
+                )
+            })?),
+            None => None,
+        };
+        let new_cursor = match cursor_col {
+            Some(col) => Some(extract_watermark(&columns, &batch, col).ok_or_else(|| {
+                anyhow!(
+                    "incremental tiebreaker column '{}' produced no cursor value for table {}",
+                    col,
+                    table_name
+                )
+            })?),
+            None => None,
+        };
 
         // Write parquet to buffer
         let mut buf = Vec::new();
@@ -221,6 +307,14 @@ async fn sync_table(
 
         output::write_output(&config.output, &filename, buf).await?;
 
+        // Persist incremental progress batch-by-batch so reruns can resume safely.
+        if let Some(ref wm) = new_watermark {
+            state.set_progress(&table_name, wm, new_cursor.as_deref())?;
+            watermark_val = Some(wm.clone());
+            cursor_val = new_cursor;
+            tracing::debug!(table = %table_name, watermark = %wm, cursor = ?cursor_val, "checkpointed watermark");
+        }
+
         batch_num += 1;
 
         // If we got fewer rows than batch_size, we're done
@@ -229,10 +323,8 @@ async fn sync_table(
         }
     }
 
-    // Persist watermark
-    if let (Some(_), Some(ref wm)) = (watermark_col, &watermark_val) {
-        state.set_watermark(&table_name, wm)?;
-        tracing::info!(table = %table_name, watermark = %wm, "updated watermark");
+    if let Some(ref wm) = watermark_val {
+        tracing::info!(table = %table_name, watermark = %wm, "final watermark");
     }
 
     tracing::info!(table = %table_name, rows = total_rows, files = batch_num, "sync complete");
@@ -276,6 +368,43 @@ pub(crate) fn extract_watermark(
             }
             Some(arr.value(last_row).to_string())
         }
+        DataType::Int16 => {
+            let arr = array.as_any().downcast_ref::<Int16Array>()?;
+            if arr.is_null(last_row) {
+                return None;
+            }
+            Some(arr.value(last_row).to_string())
+        }
+        DataType::Float64 => {
+            let arr = array.as_any().downcast_ref::<Float64Array>()?;
+            if arr.is_null(last_row) {
+                return None;
+            }
+            Some(arr.value(last_row).to_string())
+        }
+        DataType::Float32 => {
+            let arr = array.as_any().downcast_ref::<Float32Array>()?;
+            if arr.is_null(last_row) {
+                return None;
+            }
+            Some(arr.value(last_row).to_string())
+        }
+        DataType::Date32 => {
+            let arr = array.as_any().downcast_ref::<Date32Array>()?;
+            if arr.is_null(last_row) {
+                return None;
+            }
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?;
+            let d = epoch + chrono::Duration::days(arr.value(last_row) as i64);
+            Some(d.to_string())
+        }
+        DataType::Boolean => {
+            let arr = array.as_any().downcast_ref::<BooleanArray>()?;
+            if arr.is_null(last_row) {
+                return None;
+            }
+            Some(arr.value(last_row).to_string())
+        }
         DataType::Utf8 => {
             let arr = array.as_any().downcast_ref::<StringArray>()?;
             if arr.is_null(last_row) {
@@ -290,7 +419,7 @@ pub(crate) fn extract_watermark(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray, TimestampMicrosecondArray};
+    use arrow::array::{Int32Array, Int64Array, StringArray, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
@@ -335,6 +464,23 @@ mod tests {
 
         let wm = extract_watermark(&columns, &batch, "id");
         assert_eq!(wm, Some("300".to_string()));
+    }
+
+    #[test]
+    fn extract_watermark_from_int32() {
+        let columns = vec![ColumnInfo {
+            name: "id".into(),
+            pg_type: "integer".into(),
+            arrow_type: DataType::Int32,
+            is_nullable: false,
+        }];
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let arr = Int32Array::from(vec![10, 20, 30]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+
+        let wm = extract_watermark(&columns, &batch, "id");
+        assert_eq!(wm, Some("30".to_string()));
     }
 
     #[test]
