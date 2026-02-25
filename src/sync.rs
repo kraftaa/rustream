@@ -227,11 +227,13 @@ async fn sync_table(
             table,
             &columns,
             &arrow_schema,
-            watermark_col,
-            cursor_col,
-            watermark_val.as_deref(),
-            cursor_val.as_deref(),
-            config.batch_size,
+            reader::ReadBatchOptions {
+                watermark_col,
+                cursor_col,
+                watermark_val: watermark_val.as_deref(),
+                cursor_val: cursor_val.as_deref(),
+                batch_size: config.batch_size,
+            },
         )
         .await?;
 

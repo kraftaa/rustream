@@ -10,6 +10,14 @@ use tokio_postgres::{Client, Row};
 use crate::config::TableConfig;
 use crate::schema::ColumnInfo;
 
+pub struct ReadBatchOptions<'a> {
+    pub watermark_col: Option<&'a str>,
+    pub cursor_col: Option<&'a str>,
+    pub watermark_val: Option<&'a str>,
+    pub cursor_val: Option<&'a str>,
+    pub batch_size: usize,
+}
+
 /// Build the SELECT query for a table, optionally filtering by watermark.
 pub fn build_query(
     table: &TableConfig,
@@ -57,26 +65,22 @@ pub async fn read_batch(
     table: &TableConfig,
     columns: &[ColumnInfo],
     schema: &Arc<Schema>,
-    watermark_col: Option<&str>,
-    cursor_col: Option<&str>,
-    watermark_val: Option<&str>,
-    cursor_val: Option<&str>,
-    batch_size: usize,
+    options: ReadBatchOptions<'_>,
 ) -> Result<Option<RecordBatch>> {
     let query = build_query(
         table,
         columns,
-        watermark_col,
-        cursor_col,
-        watermark_val,
-        cursor_val,
-        batch_size,
+        options.watermark_col,
+        options.cursor_col,
+        options.watermark_val,
+        options.cursor_val,
+        options.batch_size,
     );
 
     tracing::debug!(%query, "executing query");
 
-    let rows = match (watermark_val, cursor_val) {
-        (Some(wm), Some(cur)) if cursor_col.is_some() => client
+    let rows = match (options.watermark_val, options.cursor_val) {
+        (Some(wm), Some(cur)) if options.cursor_col.is_some() => client
             .query(&query as &str, &[&wm, &cur])
             .await
             .with_context(|| format!("querying table {}", table.full_name()))?,
@@ -199,6 +203,37 @@ fn rows_to_array(rows: &[Row], col_idx: usize, arrow_type: &DataType) -> Result<
     }
 }
 
+/// Try to get a PG column value as a String, handling various types.
+fn get_as_string(row: &Row, idx: usize) -> Option<String> {
+    let col_type = row.columns()[idx].type_();
+
+    match *col_type {
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => row.get::<_, Option<String>>(idx),
+        Type::UUID => row.get::<_, Option<uuid::Uuid>>(idx).map(|u| u.to_string()),
+        Type::JSON | Type::JSONB => row
+            .get::<_, Option<serde_json::Value>>(idx)
+            .map(|v| v.to_string()),
+        Type::NUMERIC => row.get::<_, Option<String>>(idx),
+        Type::TIMESTAMP => row
+            .get::<_, Option<NaiveDateTime>>(idx)
+            .map(|dt| dt.to_string()),
+        Type::TIMESTAMPTZ => row
+            .get::<_, Option<chrono::DateTime<chrono::Utc>>>(idx)
+            .map(|dt| dt.to_rfc3339()),
+        Type::DATE => row.get::<_, Option<NaiveDate>>(idx).map(|d| d.to_string()),
+        Type::INT4 => row.get::<_, Option<i32>>(idx).map(|v| v.to_string()),
+        Type::INT8 => row.get::<_, Option<i64>>(idx).map(|v| v.to_string()),
+        Type::INT2 => row.get::<_, Option<i16>>(idx).map(|v| v.to_string()),
+        Type::FLOAT4 => row.get::<_, Option<f32>>(idx).map(|v| v.to_string()),
+        Type::FLOAT8 => row.get::<_, Option<f64>>(idx).map(|v| v.to_string()),
+        Type::BOOL => row.get::<_, Option<bool>>(idx).map(|v| v.to_string()),
+        _ => {
+            // Last resort: try as String
+            row.try_get::<_, Option<String>>(idx).unwrap_or(None)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,36 +348,5 @@ mod tests {
         assert!(q.contains("WHERE (\"updated_at\" > $1 OR (\"updated_at\" = $1 AND \"id\" > $2))"));
         assert!(q.contains("ORDER BY \"updated_at\" ASC, \"id\" ASC"));
         assert!(q.ends_with("LIMIT 1000"));
-    }
-}
-
-/// Try to get a PG column value as a String, handling various types.
-fn get_as_string(row: &Row, idx: usize) -> Option<String> {
-    let col_type = row.columns()[idx].type_();
-
-    match *col_type {
-        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => row.get::<_, Option<String>>(idx),
-        Type::UUID => row.get::<_, Option<uuid::Uuid>>(idx).map(|u| u.to_string()),
-        Type::JSON | Type::JSONB => row
-            .get::<_, Option<serde_json::Value>>(idx)
-            .map(|v| v.to_string()),
-        Type::NUMERIC => row.get::<_, Option<String>>(idx),
-        Type::TIMESTAMP => row
-            .get::<_, Option<NaiveDateTime>>(idx)
-            .map(|dt| dt.to_string()),
-        Type::TIMESTAMPTZ => row
-            .get::<_, Option<chrono::DateTime<chrono::Utc>>>(idx)
-            .map(|dt| dt.to_rfc3339()),
-        Type::DATE => row.get::<_, Option<NaiveDate>>(idx).map(|d| d.to_string()),
-        Type::INT4 => row.get::<_, Option<i32>>(idx).map(|v| v.to_string()),
-        Type::INT8 => row.get::<_, Option<i64>>(idx).map(|v| v.to_string()),
-        Type::INT2 => row.get::<_, Option<i16>>(idx).map(|v| v.to_string()),
-        Type::FLOAT4 => row.get::<_, Option<f32>>(idx).map(|v| v.to_string()),
-        Type::FLOAT8 => row.get::<_, Option<f64>>(idx).map(|v| v.to_string()),
-        Type::BOOL => row.get::<_, Option<bool>>(idx).map(|v| v.to_string()),
-        _ => {
-            // Last resort: try as String
-            row.try_get::<_, Option<String>>(idx).unwrap_or(None)
-        }
     }
 }

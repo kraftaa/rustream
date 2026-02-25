@@ -52,23 +52,6 @@ impl StateStore {
         Ok(Self { conn })
     }
 
-    /// Get the high watermark for a table.
-    pub fn get_watermark(&self, table_name: &str) -> Result<Option<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT watermark_value FROM watermarks WHERE table_name = ?1")
-            .context("preparing watermark select")?;
-
-        let result = stmt.query_row([table_name], |row| row.get(0)).ok();
-
-        Ok(result)
-    }
-
-    /// Set the high watermark for a table.
-    pub fn set_watermark(&self, table_name: &str, value: &str) -> Result<()> {
-        self.set_progress(table_name, value, None)
-    }
-
     /// Get high watermark and cursor for a table.
     pub fn get_progress(&self, table_name: &str) -> Result<Option<(String, Option<String>)>> {
         let mut stmt = self
@@ -135,22 +118,24 @@ mod tests {
     }
 
     #[test]
-    fn get_watermark_returns_none_initially() {
+    fn get_progress_returns_none_initially() {
         let dir = temp_state_dir();
         let store = StateStore::open(&dir).unwrap();
-        assert_eq!(store.get_watermark("users").unwrap(), None);
+        assert_eq!(store.get_progress("users").unwrap(), None);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn set_and_get_watermark() {
+    fn set_and_get_watermark_without_cursor() {
         let dir = temp_state_dir();
         let store = StateStore::open(&dir).unwrap();
 
-        store.set_watermark("users", "2026-01-15 10:30:00").unwrap();
+        store
+            .set_progress("users", "2026-01-15 10:30:00", None)
+            .unwrap();
         assert_eq!(
-            store.get_watermark("users").unwrap().as_deref(),
-            Some("2026-01-15 10:30:00")
+            store.get_progress("users").unwrap(),
+            Some(("2026-01-15 10:30:00".to_string(), None))
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -161,14 +146,14 @@ mod tests {
         let store = StateStore::open(&dir).unwrap();
 
         store
-            .set_watermark("orders", "2026-01-01 00:00:00")
+            .set_progress("orders", "2026-01-01 00:00:00", None)
             .unwrap();
         store
-            .set_watermark("orders", "2026-02-01 00:00:00")
+            .set_progress("orders", "2026-02-01 00:00:00", None)
             .unwrap();
         assert_eq!(
-            store.get_watermark("orders").unwrap().as_deref(),
-            Some("2026-02-01 00:00:00")
+            store.get_progress("orders").unwrap(),
+            Some(("2026-02-01 00:00:00".to_string(), None))
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -178,16 +163,16 @@ mod tests {
         let dir = temp_state_dir();
         let store = StateStore::open(&dir).unwrap();
 
-        store.set_watermark("users", "aaa").unwrap();
-        store.set_watermark("orders", "bbb").unwrap();
+        store.set_progress("users", "aaa", None).unwrap();
+        store.set_progress("orders", "bbb", None).unwrap();
 
         assert_eq!(
-            store.get_watermark("users").unwrap().as_deref(),
-            Some("aaa")
+            store.get_progress("users").unwrap(),
+            Some(("aaa".to_string(), None))
         );
         assert_eq!(
-            store.get_watermark("orders").unwrap().as_deref(),
-            Some("bbb")
+            store.get_progress("orders").unwrap(),
+            Some(("bbb".to_string(), None))
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -198,14 +183,14 @@ mod tests {
 
         {
             let store = StateStore::open(&dir).unwrap();
-            store.set_watermark("users", "persisted").unwrap();
+            store.set_progress("users", "persisted", None).unwrap();
         }
 
         {
             let store = StateStore::open(&dir).unwrap();
             assert_eq!(
-                store.get_watermark("users").unwrap().as_deref(),
-                Some("persisted")
+                store.get_progress("users").unwrap(),
+                Some(("persisted".to_string(), None))
             );
         }
 
