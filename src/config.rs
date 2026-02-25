@@ -181,7 +181,10 @@ exclude:
         assert_eq!(tables.len(), 2);
         assert_eq!(tables[0].name, "users");
         assert_eq!(tables[0].incremental_column.as_deref(), Some("updated_at"));
-        assert_eq!(tables[0].incremental_tiebreaker_column.as_deref(), Some("id"));
+        assert_eq!(
+            tables[0].incremental_tiebreaker_column.as_deref(),
+            Some("id")
+        );
         assert!(!tables[0].incremental_column_is_unique);
         assert_eq!(tables[0].columns.as_ref().unwrap().len(), 2);
         assert!(matches!(tables[1].partition_by, Some(PartitionBy::Date)));
