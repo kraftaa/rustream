@@ -284,6 +284,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Verifies opening state migrates legacy watermark schema and preserves existing values.
     #[test]
     fn open_migrates_legacy_watermarks_table() {
         let dir = temp_state_dir();

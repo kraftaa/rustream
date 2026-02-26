@@ -610,6 +610,7 @@ mod tests {
         assert_eq!(wm, None);
     }
 
+    /// Confirms sync resumes from saved progress and writes only remaining rows.
     #[tokio::test]
     async fn sync_table_resumes_from_saved_progress() -> Result<()> {
         let db_url = match std::env::var("RUSTREAM_IT_DB_URL") {
@@ -758,6 +759,7 @@ mod tests {
         Ok(())
     }
 
+    /// Ensures cursor mode fails fast when saved state is missing cursor_value.
     #[tokio::test]
     async fn sync_table_fails_when_cursor_state_missing_in_cursor_mode() -> Result<()> {
         let db_url = match std::env::var("RUSTREAM_IT_DB_URL") {
@@ -851,6 +853,7 @@ mod tests {
         Ok(())
     }
 
+    /// Verifies unique-watermark mode works without a tiebreaker and persists progress.
     #[tokio::test]
     async fn sync_table_supports_unique_watermark_without_tiebreaker() -> Result<()> {
         let db_url = match std::env::var("RUSTREAM_IT_DB_URL") {

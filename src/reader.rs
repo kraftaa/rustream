@@ -354,6 +354,7 @@ mod tests {
         assert!(q.ends_with("LIMIT 1000"));
     }
 
+    /// Ensures duplicate watermark values are paged safely using the cursor tiebreaker.
     #[tokio::test]
     async fn read_batch_cursor_paging_handles_duplicate_watermarks() {
         let db_url = match std::env::var("RUSTREAM_IT_DB_URL") {
