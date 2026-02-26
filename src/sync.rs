@@ -757,4 +757,189 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn sync_table_fails_when_cursor_state_missing_in_cursor_mode() -> Result<()> {
+        let db_url = match std::env::var("RUSTREAM_IT_DB_URL") {
+            Ok(v) => v,
+            Err(_) => return Ok(()), // Optional integration-style test.
+        };
+
+        let (client, connection) = tokio_postgres::connect(&db_url, NoTls).await?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let table_name = format!("rustream_it_sync_missing_cursor_{suffix}");
+        let full_table = format!("public.{table_name}");
+
+        client
+            .execute(
+                &format!(
+                    "CREATE TABLE {full_table} (
+                        id INTEGER PRIMARY KEY,
+                        updated_at TIMESTAMPTZ NOT NULL
+                    )"
+                ),
+                &[],
+            )
+            .await?;
+
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {full_table} (id, updated_at) VALUES
+                    (1, '2026-01-01T00:00:00Z'),
+                    (2, '2026-01-01T00:00:00Z')"
+                ),
+                &[],
+            )
+            .await?;
+
+        let tmp = tempfile::tempdir()?;
+        let out_dir = tmp.path().join("out");
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&out_dir)?;
+        std::fs::create_dir_all(&state_dir)?;
+
+        let table = TableConfig {
+            name: table_name.clone(),
+            schema: Some("public".to_string()),
+            columns: None,
+            incremental_column: Some("updated_at".to_string()),
+            incremental_tiebreaker_column: Some("id".to_string()),
+            incremental_column_is_unique: false,
+            partition_by: None,
+        };
+
+        let state = StateStore::open(state_dir.to_str().unwrap())?;
+        // Seed legacy-like state with watermark only, no cursor.
+        state.set_progress(&full_table, "2026-01-01 00:00:00.000000", None)?;
+
+        let config = Config {
+            postgres: PostgresConfig {
+                host: "localhost".to_string(),
+                port: 5432,
+                database: "ignored_for_sync_table_test".to_string(),
+                user: "ignored".to_string(),
+                password: None,
+            },
+            output: Some(OutputConfig::Local {
+                path: out_dir.to_string_lossy().to_string(),
+            }),
+            tables: None,
+            exclude: vec![],
+            schema: "public".to_string(),
+            batch_size: 2,
+            state_dir: Some(state_dir.to_string_lossy().to_string()),
+            format: OutputFormat::Parquet,
+            catalog: None,
+            warehouse: None,
+            ingest: None,
+        };
+
+        let err = sync_table(&client, &config, &table, &state, None)
+            .await
+            .expect_err("cursor mode should fail when saved cursor is missing");
+        assert!(err.to_string().contains("has watermark but no cursor"));
+
+        client
+            .execute(&format!("DROP TABLE {full_table}"), &[])
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_table_supports_unique_watermark_without_tiebreaker() -> Result<()> {
+        let db_url = match std::env::var("RUSTREAM_IT_DB_URL") {
+            Ok(v) => v,
+            Err(_) => return Ok(()), // Optional integration-style test.
+        };
+
+        let (client, connection) = tokio_postgres::connect(&db_url, NoTls).await?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let table_name = format!("rustream_it_sync_unique_wm_{suffix}");
+        let full_table = format!("public.{table_name}");
+
+        client
+            .execute(
+                &format!(
+                    "CREATE TABLE {full_table} (
+                        id INTEGER PRIMARY KEY,
+                        payload TEXT
+                    )"
+                ),
+                &[],
+            )
+            .await?;
+
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {full_table} (id, payload) VALUES
+                    (1, 'a'),
+                    (2, 'b'),
+                    (3, 'c'),
+                    (4, 'd')"
+                ),
+                &[],
+            )
+            .await?;
+
+        let tmp = tempfile::tempdir()?;
+        let out_dir = tmp.path().join("out");
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&out_dir)?;
+        std::fs::create_dir_all(&state_dir)?;
+
+        let table = TableConfig {
+            name: table_name.clone(),
+            schema: Some("public".to_string()),
+            columns: None,
+            incremental_column: Some("id".to_string()),
+            incremental_tiebreaker_column: None,
+            incremental_column_is_unique: true,
+            partition_by: None,
+        };
+
+        let state = StateStore::open(state_dir.to_str().unwrap())?;
+        let config = Config {
+            postgres: PostgresConfig {
+                host: "localhost".to_string(),
+                port: 5432,
+                database: "ignored_for_sync_table_test".to_string(),
+                user: "ignored".to_string(),
+                password: None,
+            },
+            output: Some(OutputConfig::Local {
+                path: out_dir.to_string_lossy().to_string(),
+            }),
+            tables: None,
+            exclude: vec![],
+            schema: "public".to_string(),
+            batch_size: 2,
+            state_dir: Some(state_dir.to_string_lossy().to_string()),
+            format: OutputFormat::Parquet,
+            catalog: None,
+            warehouse: None,
+            ingest: None,
+        };
+
+        sync_table(&client, &config, &table, &state, None).await?;
+        let progress = state.get_progress(&full_table)?.unwrap();
+        assert_eq!(progress.0, "4");
+        assert_eq!(progress.1, None);
+
+        client
+            .execute(&format!("DROP TABLE {full_table}"), &[])
+            .await?;
+
+        Ok(())
+    }
 }
