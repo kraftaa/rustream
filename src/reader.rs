@@ -237,6 +237,10 @@ fn get_as_string(row: &Row, idx: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema;
+    use crate::sync::extract_watermark;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio_postgres::NoTls;
 
     fn make_table(name: &str) -> TableConfig {
         TableConfig {
@@ -348,5 +352,136 @@ mod tests {
         assert!(q.contains("WHERE (\"updated_at\" > $1 OR (\"updated_at\" = $1 AND \"id\" > $2))"));
         assert!(q.contains("ORDER BY \"updated_at\" ASC, \"id\" ASC"));
         assert!(q.ends_with("LIMIT 1000"));
+    }
+
+    #[tokio::test]
+    async fn read_batch_cursor_paging_handles_duplicate_watermarks() {
+        let db_url = match std::env::var("RUSTREAM_IT_DB_URL") {
+            Ok(v) => v,
+            Err(_) => return, // Optional integration-style test; set env var to run.
+        };
+
+        let (client, connection) = tokio_postgres::connect(&db_url, NoTls).await.unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let table_name = format!("rustream_it_reader_{suffix}");
+
+        client
+            .execute(
+                &format!(
+                    "CREATE TABLE public.{table_name} (
+                        id INTEGER PRIMARY KEY,
+                        updated_at TIMESTAMPTZ NOT NULL,
+                        payload TEXT
+                    )"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO public.{table_name} (id, updated_at, payload) VALUES
+                    (1, '2026-01-01T00:00:00Z', 'a'),
+                    (2, '2026-01-01T00:00:00Z', 'b'),
+                    (3, '2026-01-01T00:00:00Z', 'c'),
+                    (4, '2026-01-01T00:01:00Z', 'd')"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let table = TableConfig {
+            name: table_name.clone(),
+            schema: Some("public".into()),
+            columns: None,
+            incremental_column: Some("updated_at".into()),
+            incremental_tiebreaker_column: Some("id".into()),
+            incremental_column_is_unique: false,
+            partition_by: None,
+        };
+        let columns = schema::introspect_table(&client, &table).await.unwrap();
+        let arrow_schema = schema::build_arrow_schema(&columns);
+
+        let batch1 = read_batch(
+            &client,
+            &table,
+            &columns,
+            &arrow_schema,
+            ReadBatchOptions {
+                watermark_col: Some("updated_at"),
+                cursor_col: Some("id"),
+                watermark_val: None,
+                cursor_val: None,
+                batch_size: 2,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(batch1.num_rows(), 2);
+        let wm1 = extract_watermark(&columns, &batch1, "updated_at").unwrap();
+        let cur1 = extract_watermark(&columns, &batch1, "id").unwrap();
+
+        let batch2 = read_batch(
+            &client,
+            &table,
+            &columns,
+            &arrow_schema,
+            ReadBatchOptions {
+                watermark_col: Some("updated_at"),
+                cursor_col: Some("id"),
+                watermark_val: Some(&wm1),
+                cursor_val: Some(&cur1),
+                batch_size: 2,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(batch2.num_rows(), 2);
+
+        let id_col = columns.iter().position(|c| c.name == "id").unwrap();
+        let ids = batch2
+            .column(id_col)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.value(0), 3);
+        assert_eq!(ids.value(1), 4);
+
+        let wm2 = extract_watermark(&columns, &batch2, "updated_at").unwrap();
+        let cur2 = extract_watermark(&columns, &batch2, "id").unwrap();
+
+        let batch3 = read_batch(
+            &client,
+            &table,
+            &columns,
+            &arrow_schema,
+            ReadBatchOptions {
+                watermark_col: Some("updated_at"),
+                cursor_col: Some("id"),
+                watermark_val: Some(&wm2),
+                cursor_val: Some(&cur2),
+                batch_size: 2,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(batch3.is_none());
+
+        client
+            .execute(&format!("DROP TABLE public.{table_name}"), &[])
+            .await
+            .unwrap();
     }
 }
