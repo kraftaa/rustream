@@ -21,6 +21,19 @@ cargo build --release
 # binary is at target/release/rustream
 ```
 
+### From GitHub Release binaries
+
+Download the archive for your OS from the latest release, extract it, and place `rustream`
+on your `PATH`.
+
+```bash
+# Example for Linux x86_64
+curl -L -o rustream.tar.gz https://github.com/kraftaa/rustream/releases/latest/download/rustream-linux-x86_64.tar.gz
+tar -xzf rustream.tar.gz
+chmod +x rustream
+./rustream --help
+```
+
 ### With maturin (local dev)
 
 ```bash
