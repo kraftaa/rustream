@@ -1,6 +1,6 @@
 [package]
 name = "rustream"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "Fast Postgres → Parquet sync tool"
 license = "MIT"
