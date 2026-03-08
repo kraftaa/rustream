@@ -478,10 +478,19 @@ pub(crate) fn extract_watermark(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{OutputConfig, PostgresConfig};
+    use crate::reader;
+    use crate::schema;
+    use crate::state::StateStore;
+    use anyhow::Result;
     use arrow::array::{Int32Array, Int64Array, StringArray, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
     use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio_postgres::NoTls;
 
     #[test]
     fn extract_watermark_from_timestamp() {
@@ -599,5 +608,341 @@ mod tests {
 
         let wm = extract_watermark(&columns, &batch, "updated_at");
         assert_eq!(wm, None);
+    }
+
+    /// Confirms sync resumes from saved progress and writes only remaining rows.
+    #[tokio::test]
+    async fn sync_table_resumes_from_saved_progress() -> Result<()> {
+        let db_url = match std::env::var("RUSTREAM_IT_DB_URL") {
+            Ok(v) => v,
+            Err(_) => return Ok(()), // Optional integration-style test.
+        };
+
+        let (client, connection) = tokio_postgres::connect(&db_url, NoTls).await?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let table_name = format!("rustream_it_sync_resume_{suffix}");
+        let full_table = format!("public.{table_name}");
+
+        client
+            .execute(
+                &format!(
+                    "CREATE TABLE {full_table} (
+                        id INTEGER PRIMARY KEY,
+                        updated_at TIMESTAMPTZ NOT NULL,
+                        payload TEXT
+                    )"
+                ),
+                &[],
+            )
+            .await?;
+
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {full_table} (id, updated_at, payload) VALUES
+                    (1, '2026-01-01T00:00:00Z', 'a'),
+                    (2, '2026-01-01T00:00:00Z', 'b'),
+                    (3, '2026-01-01T00:00:00Z', 'c'),
+                    (4, '2026-01-01T00:01:00Z', 'd')"
+                ),
+                &[],
+            )
+            .await?;
+
+        let tmp = tempfile::tempdir()?;
+        let out_dir = tmp.path().join("out");
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&out_dir)?;
+        std::fs::create_dir_all(&state_dir)?;
+
+        let table = TableConfig {
+            name: table_name.clone(),
+            schema: Some("public".to_string()),
+            columns: None,
+            incremental_column: Some("updated_at".to_string()),
+            incremental_tiebreaker_column: Some("id".to_string()),
+            incremental_column_is_unique: false,
+            partition_by: None,
+        };
+
+        // Derive a realistic saved progress point from first page (ids 1,2).
+        let columns = schema::introspect_table(&client, &table).await?;
+        let arrow_schema = schema::build_arrow_schema(&columns);
+        let first_batch = reader::read_batch(
+            &client,
+            &table,
+            &columns,
+            &arrow_schema,
+            reader::ReadBatchOptions {
+                watermark_col: Some("updated_at"),
+                cursor_col: Some("id"),
+                watermark_val: None,
+                cursor_val: None,
+                batch_size: 2,
+            },
+        )
+        .await?
+        .expect("first batch expected");
+
+        let saved_wm = extract_watermark(&columns, &first_batch, "updated_at").unwrap();
+        let saved_cursor = extract_watermark(&columns, &first_batch, "id").unwrap();
+
+        let state = StateStore::open(state_dir.to_str().unwrap())?;
+        state.set_progress(&full_table, &saved_wm, Some(&saved_cursor))?;
+
+        let config = Config {
+            postgres: PostgresConfig {
+                host: "localhost".to_string(),
+                port: 5432,
+                database: "ignored_for_sync_table_test".to_string(),
+                user: "ignored".to_string(),
+                password: None,
+            },
+            output: Some(OutputConfig::Local {
+                path: out_dir.to_string_lossy().to_string(),
+            }),
+            tables: None,
+            exclude: vec![],
+            schema: "public".to_string(),
+            batch_size: 2,
+            state_dir: Some(state_dir.to_string_lossy().to_string()),
+            format: OutputFormat::Parquet,
+            catalog: None,
+            warehouse: None,
+            ingest: None,
+        };
+
+        sync_table(&client, &config, &table, &state, None).await?;
+
+        // Validate only remaining ids (3,4) are written.
+        let mut seen_ids = Vec::new();
+        for entry in std::fs::read_dir(out_dir.join(&table_name))? {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("parquet") {
+                continue;
+            }
+            let file = File::open(path)?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+            let reader = builder.build()?;
+            for batch in reader {
+                let batch = batch?;
+                let id_idx = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == "id")
+                    .unwrap();
+                let arr = batch
+                    .column(id_idx)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                for i in 0..arr.len() {
+                    seen_ids.push(arr.value(i));
+                }
+            }
+        }
+        seen_ids.sort_unstable();
+        assert_eq!(seen_ids, vec![3, 4]);
+
+        let progress = state.get_progress(&full_table)?.unwrap();
+        assert_eq!(progress.1.as_deref(), Some("4"));
+
+        client
+            .execute(&format!("DROP TABLE {full_table}"), &[])
+            .await?;
+
+        Ok(())
+    }
+
+    /// Ensures cursor mode fails fast when saved state is missing cursor_value.
+    #[tokio::test]
+    async fn sync_table_fails_when_cursor_state_missing_in_cursor_mode() -> Result<()> {
+        let db_url = match std::env::var("RUSTREAM_IT_DB_URL") {
+            Ok(v) => v,
+            Err(_) => return Ok(()), // Optional integration-style test.
+        };
+
+        let (client, connection) = tokio_postgres::connect(&db_url, NoTls).await?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let table_name = format!("rustream_it_sync_missing_cursor_{suffix}");
+        let full_table = format!("public.{table_name}");
+
+        client
+            .execute(
+                &format!(
+                    "CREATE TABLE {full_table} (
+                        id INTEGER PRIMARY KEY,
+                        updated_at TIMESTAMPTZ NOT NULL
+                    )"
+                ),
+                &[],
+            )
+            .await?;
+
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {full_table} (id, updated_at) VALUES
+                    (1, '2026-01-01T00:00:00Z'),
+                    (2, '2026-01-01T00:00:00Z')"
+                ),
+                &[],
+            )
+            .await?;
+
+        let tmp = tempfile::tempdir()?;
+        let out_dir = tmp.path().join("out");
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&out_dir)?;
+        std::fs::create_dir_all(&state_dir)?;
+
+        let table = TableConfig {
+            name: table_name.clone(),
+            schema: Some("public".to_string()),
+            columns: None,
+            incremental_column: Some("updated_at".to_string()),
+            incremental_tiebreaker_column: Some("id".to_string()),
+            incremental_column_is_unique: false,
+            partition_by: None,
+        };
+
+        let state = StateStore::open(state_dir.to_str().unwrap())?;
+        // Seed legacy-like state with watermark only, no cursor.
+        state.set_progress(&full_table, "2026-01-01 00:00:00.000000", None)?;
+
+        let config = Config {
+            postgres: PostgresConfig {
+                host: "localhost".to_string(),
+                port: 5432,
+                database: "ignored_for_sync_table_test".to_string(),
+                user: "ignored".to_string(),
+                password: None,
+            },
+            output: Some(OutputConfig::Local {
+                path: out_dir.to_string_lossy().to_string(),
+            }),
+            tables: None,
+            exclude: vec![],
+            schema: "public".to_string(),
+            batch_size: 2,
+            state_dir: Some(state_dir.to_string_lossy().to_string()),
+            format: OutputFormat::Parquet,
+            catalog: None,
+            warehouse: None,
+            ingest: None,
+        };
+
+        let err = sync_table(&client, &config, &table, &state, None)
+            .await
+            .expect_err("cursor mode should fail when saved cursor is missing");
+        assert!(err.to_string().contains("has watermark but no cursor"));
+
+        client
+            .execute(&format!("DROP TABLE {full_table}"), &[])
+            .await?;
+
+        Ok(())
+    }
+
+    /// Verifies unique-watermark mode works without a tiebreaker and persists progress.
+    #[tokio::test]
+    async fn sync_table_supports_unique_watermark_without_tiebreaker() -> Result<()> {
+        let db_url = match std::env::var("RUSTREAM_IT_DB_URL") {
+            Ok(v) => v,
+            Err(_) => return Ok(()), // Optional integration-style test.
+        };
+
+        let (client, connection) = tokio_postgres::connect(&db_url, NoTls).await?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let table_name = format!("rustream_it_sync_unique_wm_{suffix}");
+        let full_table = format!("public.{table_name}");
+
+        client
+            .execute(
+                &format!(
+                    "CREATE TABLE {full_table} (
+                        id INTEGER PRIMARY KEY,
+                        payload TEXT
+                    )"
+                ),
+                &[],
+            )
+            .await?;
+
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {full_table} (id, payload) VALUES
+                    (1, 'a'),
+                    (2, 'b'),
+                    (3, 'c'),
+                    (4, 'd')"
+                ),
+                &[],
+            )
+            .await?;
+
+        let tmp = tempfile::tempdir()?;
+        let out_dir = tmp.path().join("out");
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&out_dir)?;
+        std::fs::create_dir_all(&state_dir)?;
+
+        let table = TableConfig {
+            name: table_name.clone(),
+            schema: Some("public".to_string()),
+            columns: None,
+            incremental_column: Some("id".to_string()),
+            incremental_tiebreaker_column: None,
+            incremental_column_is_unique: true,
+            partition_by: None,
+        };
+
+        let state = StateStore::open(state_dir.to_str().unwrap())?;
+        let config = Config {
+            postgres: PostgresConfig {
+                host: "localhost".to_string(),
+                port: 5432,
+                database: "ignored_for_sync_table_test".to_string(),
+                user: "ignored".to_string(),
+                password: None,
+            },
+            output: Some(OutputConfig::Local {
+                path: out_dir.to_string_lossy().to_string(),
+            }),
+            tables: None,
+            exclude: vec![],
+            schema: "public".to_string(),
+            batch_size: 2,
+            state_dir: Some(state_dir.to_string_lossy().to_string()),
+            format: OutputFormat::Parquet,
+            catalog: None,
+            warehouse: None,
+            ingest: None,
+        };
+
+        sync_table(&client, &config, &table, &state, None).await?;
+        let progress = state.get_progress(&full_table)?.unwrap();
+        assert_eq!(progress.0, "4");
+        assert_eq!(progress.1, None);
+
+        client
+            .execute(&format!("DROP TABLE {full_table}"), &[])
+            .await?;
+
+        Ok(())
     }
 }

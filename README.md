@@ -242,6 +242,16 @@ If no `tables` are listed, the target table name is inferred from the parent dir
 | `ingest.tables[].key_columns` | Primary key columns (required for upsert mode) |
 | `ingest.tables[].create_if_missing` | Auto-CREATE TABLE from file schema (default: false) |
 
+## Running Integration Tests
+
+Some DB-backed tests are optional and run only when `RUSTREAM_IT_DB_URL` is set.
+Without this env var, those tests no-op/return early.
+
+```bash
+export RUSTREAM_IT_DB_URL="host=localhost port=5432 dbname=mydb user=postgres password=secret"
+cargo test
+```
+
 ## How it works
 
 ### Sync (Postgres → Parquet)

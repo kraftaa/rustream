@@ -135,6 +135,7 @@ impl StateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
     use std::fs;
 
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -279,6 +280,53 @@ mod tests {
             store.get_progress("users").unwrap(),
             Some(("2026-01-15 10:30:00".to_string(), Some("42".to_string())))
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Verifies opening state migrates legacy watermark schema and preserves existing values.
+    #[test]
+    fn open_migrates_legacy_watermarks_table() {
+        let dir = temp_state_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = Path::new(&dir).join("rustream_state.db");
+
+        // Simulate an old state db that predates cursor_value.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE watermarks (
+                table_name TEXT PRIMARY KEY,
+                watermark_value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO watermarks (table_name, watermark_value) VALUES (?1, ?2)",
+            ["users", "2026-01-01 00:00:00"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = StateStore::open(&dir).unwrap();
+        assert_eq!(
+            store.get_progress("users").unwrap(),
+            Some(("2026-01-01 00:00:00".to_string(), None))
+        );
+
+        // Verify migrated schema contains cursor_value.
+        let conn = Connection::open(&db_path).unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(watermarks)").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut has_cursor = false;
+        while let Some(row) = rows.next().unwrap() {
+            let col_name: String = row.get(1).unwrap();
+            if col_name == "cursor_value" {
+                has_cursor = true;
+                break;
+            }
+        }
+        assert!(has_cursor);
 
         let _ = fs::remove_dir_all(&dir);
     }
