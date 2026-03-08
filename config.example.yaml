@@ -24,6 +24,18 @@ output:
 #   prefix: raw/postgres
 #   region: us-east-1
 
+# Output format: parquet (default) or iceberg
+# format: parquet
+
+# Iceberg output (uncomment to use instead of standalone Parquet)
+# Writes proper Iceberg table metadata so Spark, Trino, Athena can query it.
+# format: iceberg
+# warehouse: s3://my-bucket/warehouse   # or ./local_warehouse
+# catalog:
+#   type: filesystem                     # default, zero setup
+#   # type: glue                         # for Athena (requires --features glue)
+#   # glue_database: my_db              # required when type=glue
+
 # Batch size for reading rows from Postgres
 batch_size: 10000
 
@@ -61,3 +73,38 @@ tables:
 # exclude:                # skip these tables
 #   - schema_migrations
 #   - ar_internal_metadata
+
+# ─── Ingest: load Parquet/CSV files into Postgres ───────────────
+# Preview before ingesting:
+#   rustream ingest --config config.yaml --dry-run
+#
+# ingest:
+#   input:
+#     type: local
+#     path: ./parquet_files
+#     pattern: "**/*.parquet"
+#
+#   # S3 input (uncomment to use instead of local):
+#   # input:
+#   #   type: s3
+#   #   bucket: my-data-lake
+#   #   prefix: raw/postgres
+#   #   region: us-east-1
+#   #   pattern: "**/*.parquet"
+#
+#   file_format: parquet             # "parquet" or "csv"
+#   write_mode: insert               # "insert" | "upsert" | "truncate_insert"
+#   batch_size: 5000
+#   target_schema: public            # Postgres schema for target tables
+#
+#   tables:
+#     - file_pattern: "users/*.parquet"
+#       target_table: users
+#       key_columns: [id]            # required for upsert mode
+#       create_if_missing: true      # auto-CREATE TABLE from file schema
+#
+#     - file_pattern: "orders/**/*.parquet"
+#       target_table: orders
+#       key_columns: [id]
+#
+#   # If no tables listed, table name is inferred from directory/filename

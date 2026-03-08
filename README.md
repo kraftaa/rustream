@@ -1,6 +1,6 @@
 # rustream
 
-Fast Postgres to Parquet sync tool. Reads tables from Postgres, writes Parquet files to local disk or S3. Supports incremental sync via `updated_at` watermark tracking.
+Bidirectional Postgres sync tool. Reads tables from Postgres and writes Parquet/Iceberg files to local disk or S3, or ingests Parquet/CSV files from local disk or S3 back into Postgres. Supports incremental sync via watermark tracking and upsert-based ingestion.
 
 ## Installation
 
@@ -31,6 +31,8 @@ maturin develop --release
 
 ## Usage
 
+### Sync (Postgres → Parquet/S3)
+
 ```bash
 # Copy and edit the example config
 cp config.example.yaml config.yaml
@@ -42,10 +44,21 @@ rustream sync --config config.yaml --dry-run
 rustream sync --config config.yaml
 ```
 
+### Ingest (S3/local → Postgres)
+
+```bash
+# Preview what would be ingested
+rustream ingest --config ingest_config.yaml --dry-run
+
+# Run ingest
+rustream ingest --config ingest_config.yaml
+```
+
 Enable debug logging with `RUST_LOG`:
 
 ```bash
 RUST_LOG=rustream=debug rustream sync --config config.yaml
+RUST_LOG=rustream=debug rustream ingest --config ingest_config.yaml
 ```
 
 ## Configuration
@@ -116,7 +129,72 @@ output:
 
 AWS credentials come from environment variables, `~/.aws/credentials`, or IAM role.
 
-### Config reference
+### Iceberg output
+
+```yaml
+output:
+  type: s3
+  bucket: my-data-lake
+  prefix: warehouse
+  region: us-east-1
+
+format: iceberg
+warehouse: s3://my-data-lake/warehouse
+catalog:
+  type: filesystem    # or "glue" (requires --features glue)
+  # glue_database: my_db  # required when type=glue
+```
+
+### Ingest (S3 → Postgres)
+
+```yaml
+postgres:
+  host: localhost
+  database: mydb
+  user: postgres
+  password: secret
+
+ingest:
+  input:
+    type: s3
+    bucket: my-data-lake
+    prefix: raw/postgres/
+    region: us-east-1
+    pattern: "**/*.parquet"
+
+  file_format: parquet       # "parquet" or "csv"
+  write_mode: upsert         # "insert" | "upsert" | "truncate_insert"
+  batch_size: 5000
+  target_schema: public
+
+  tables:
+    - file_pattern: "users/*.parquet"
+      target_table: users
+      key_columns: [id]
+      create_if_missing: true
+
+    - file_pattern: "orders/*.parquet"
+      target_table: orders
+      key_columns: [id]
+```
+
+### Ingest from local files
+
+```yaml
+ingest:
+  input:
+    type: local
+    path: ./parquet_files
+    pattern: "**/*.parquet"
+
+  file_format: parquet
+  write_mode: insert
+  batch_size: 5000
+```
+
+If no `tables` are listed, the target table name is inferred from the parent directory or filename.
+
+### Config reference (sync)
 
 | Field | Description |
 |---|---|
@@ -141,8 +219,42 @@ AWS credentials come from environment variables, `~/.aws/credentials`, or IAM ro
 | `tables[].incremental_tiebreaker_column` | Stable cursor column for duplicate-safe incremental paging (required when `incremental_column` is set; recommended: primary key) |
 | `tables[].incremental_column_is_unique` | Allow watermark-only incremental mode when incremental column is strictly unique/monotonic (e.g. append-only `id`) |
 | `tables[].partition_by` | Partition output files: `date`, `month`, or `year` |
+| `format` | Output format: `parquet` (default) or `iceberg` |
+| `warehouse` | Warehouse path for Iceberg (required when format=iceberg) |
+| `catalog.type` | Iceberg catalog: `filesystem` (default) or `glue` |
+
+### Config reference (ingest)
+
+| Field | Description |
+|---|---|
+| `ingest.input.type` | `local` or `s3` |
+| `ingest.input.path` | Local directory (when type=local) |
+| `ingest.input.bucket` | S3 bucket (when type=s3) |
+| `ingest.input.prefix` | S3 key prefix (when type=s3) |
+| `ingest.input.region` | AWS region (when type=s3, optional) |
+| `ingest.input.pattern` | Glob pattern for file matching (default: `**/*.parquet`) |
+| `ingest.file_format` | `parquet` (default) or `csv` |
+| `ingest.write_mode` | `insert` (default), `upsert`, or `truncate_insert` |
+| `ingest.batch_size` | Rows per INSERT statement (default: 5000) |
+| `ingest.target_schema` | Postgres schema for target tables (default: `public`) |
+| `ingest.tables[].file_pattern` | Glob pattern to match files to this table |
+| `ingest.tables[].target_table` | Postgres table to write to |
+| `ingest.tables[].key_columns` | Primary key columns (required for upsert mode) |
+| `ingest.tables[].create_if_missing` | Auto-CREATE TABLE from file schema (default: false) |
+
+## Running Integration Tests
+
+Some DB-backed tests are optional and run only when `RUSTREAM_IT_DB_URL` is set.
+Without this env var, those tests no-op/return early.
+
+```bash
+export RUSTREAM_IT_DB_URL="host=localhost port=5432 dbname=mydb user=postgres password=secret"
+cargo test
+```
 
 ## How it works
+
+### Sync (Postgres → Parquet)
 
 1. Connects to Postgres and introspects each table's schema via `information_schema`
 2. Maps Postgres column types to Arrow types automatically
@@ -153,6 +265,15 @@ AWS credentials come from environment variables, `~/.aws/credentials`, or IAM ro
 7. On next run, reads rows after the saved `(watermark, cursor)` position
 
 Tables without `incremental_column` do a full sync every run.
+
+### Ingest (Parquet/CSV → Postgres)
+
+1. Discovers files matching the glob pattern from local disk or S3
+2. Skips files already ingested (tracked in local SQLite)
+3. Reads each file into Arrow RecordBatches (Parquet or CSV with schema inference)
+4. Creates the target table if `create_if_missing: true` (DDL from Arrow schema)
+5. Writes rows via multi-row parameterized INSERT or INSERT...ON CONFLICT (upsert)
+6. Marks each file as ingested in SQLite to avoid reprocessing on next run
 
 ## Supported Postgres types
 

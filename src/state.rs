@@ -23,9 +23,15 @@ impl StateStore {
                 watermark_value TEXT NOT NULL,
                 cursor_value TEXT,
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )",
+            );
+            CREATE TABLE IF NOT EXISTS ingested_files (
+                file_key TEXT PRIMARY KEY,
+                target_table TEXT NOT NULL,
+                rows_ingested INTEGER NOT NULL,
+                ingested_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
         )
-        .context("creating watermarks table")?;
+        .context("creating state tables")?;
 
         // Backward-compatible migration for existing state DBs.
         let has_cursor_col = conn
@@ -91,11 +97,45 @@ impl StateStore {
 
         Ok(())
     }
+
+    /// Check if a file has already been ingested.
+    pub fn is_file_ingested(&self, file_key: &str) -> Result<bool> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT 1 FROM ingested_files WHERE file_key = ?1")
+            .context("preparing ingested_files select")?;
+
+        let exists = stmt.exists([file_key]).context("checking ingested file")?;
+        Ok(exists)
+    }
+
+    /// Mark a file as ingested.
+    pub fn mark_file_ingested(
+        &self,
+        file_key: &str,
+        target_table: &str,
+        rows_ingested: u64,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO ingested_files (file_key, target_table, rows_ingested, ingested_at)
+                 VALUES (?1, ?2, ?3, datetime('now'))
+                 ON CONFLICT(file_key) DO UPDATE SET
+                    target_table = excluded.target_table,
+                    rows_ingested = excluded.rows_ingested,
+                    ingested_at = excluded.ingested_at",
+                rusqlite::params![file_key, target_table, rows_ingested as i64],
+            )
+            .with_context(|| format!("marking file as ingested: {file_key}"))?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
     use std::fs;
 
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -178,6 +218,36 @@ mod tests {
     }
 
     #[test]
+    fn ingested_files_tracking() {
+        let dir = temp_state_dir();
+        let store = StateStore::open(&dir).unwrap();
+
+        assert!(!store.is_file_ingested("users/part-0.parquet").unwrap());
+
+        store
+            .mark_file_ingested("users/part-0.parquet", "users", 1000)
+            .unwrap();
+        assert!(store.is_file_ingested("users/part-0.parquet").unwrap());
+        assert!(!store.is_file_ingested("users/part-1.parquet").unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ingested_file_update() {
+        let dir = temp_state_dir();
+        let store = StateStore::open(&dir).unwrap();
+
+        store
+            .mark_file_ingested("orders/data.parquet", "orders", 500)
+            .unwrap();
+        store
+            .mark_file_ingested("orders/data.parquet", "orders", 750)
+            .unwrap();
+        assert!(store.is_file_ingested("orders/data.parquet").unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn state_persists_across_opens() {
         let dir = temp_state_dir();
 
@@ -210,6 +280,53 @@ mod tests {
             store.get_progress("users").unwrap(),
             Some(("2026-01-15 10:30:00".to_string(), Some("42".to_string())))
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Verifies opening state migrates legacy watermark schema and preserves existing values.
+    #[test]
+    fn open_migrates_legacy_watermarks_table() {
+        let dir = temp_state_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = Path::new(&dir).join("rustream_state.db");
+
+        // Simulate an old state db that predates cursor_value.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE watermarks (
+                table_name TEXT PRIMARY KEY,
+                watermark_value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO watermarks (table_name, watermark_value) VALUES (?1, ?2)",
+            ["users", "2026-01-01 00:00:00"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = StateStore::open(&dir).unwrap();
+        assert_eq!(
+            store.get_progress("users").unwrap(),
+            Some(("2026-01-01 00:00:00".to_string(), None))
+        );
+
+        // Verify migrated schema contains cursor_value.
+        let conn = Connection::open(&db_path).unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(watermarks)").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut has_cursor = false;
+        while let Some(row) = rows.next().unwrap() {
+            let col_name: String = row.get(1).unwrap();
+            if col_name == "cursor_value" {
+                has_cursor = true;
+                break;
+            }
+        }
+        assert!(has_cursor);
 
         let _ = fs::remove_dir_all(&dir);
     }

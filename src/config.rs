@@ -5,7 +5,8 @@ use std::path::Path;
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub postgres: PostgresConfig,
-    pub output: OutputConfig,
+    #[serde(default)]
+    pub output: Option<OutputConfig>,
     #[serde(default)]
     pub tables: Option<Vec<TableConfig>>,
     #[serde(default)]
@@ -16,6 +17,38 @@ pub struct Config {
     pub batch_size: usize,
     #[serde(default)]
     pub state_dir: Option<String>,
+    #[serde(default)]
+    pub format: OutputFormat,
+    #[serde(default)]
+    pub catalog: Option<CatalogConfig>,
+    #[serde(default)]
+    pub warehouse: Option<String>,
+    #[serde(default)]
+    pub ingest: Option<IngestConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputFormat {
+    #[default]
+    Parquet,
+    Iceberg,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CatalogConfig {
+    #[serde(default = "default_catalog_type", rename = "type")]
+    pub catalog_type: CatalogType,
+    #[serde(default)]
+    pub glue_database: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogType {
+    #[default]
+    Filesystem,
+    Glue,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -81,6 +114,83 @@ impl TableConfig {
     }
 }
 
+// --- Ingest config ---
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct IngestConfig {
+    pub input: InputConfig,
+    #[serde(default = "default_ingest_file_format")]
+    pub file_format: FileFormat,
+    #[serde(default)]
+    pub write_mode: WriteMode,
+    #[serde(default = "default_ingest_batch_size")]
+    pub batch_size: usize,
+    #[serde(default)]
+    pub tables: Vec<IngestTableConfig>,
+    #[serde(default = "default_schema")]
+    pub target_schema: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "type")]
+pub enum InputConfig {
+    #[serde(rename = "local")]
+    Local {
+        path: String,
+        #[serde(default = "default_pattern")]
+        pattern: String,
+    },
+    #[serde(rename = "s3")]
+    S3 {
+        bucket: String,
+        #[serde(default)]
+        prefix: Option<String>,
+        #[serde(default)]
+        region: Option<String>,
+        #[serde(default = "default_pattern")]
+        pattern: String,
+    },
+}
+
+#[derive(Debug, Deserialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileFormat {
+    #[default]
+    Parquet,
+    Csv,
+}
+
+#[derive(Debug, Deserialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteMode {
+    #[default]
+    Insert,
+    Upsert,
+    TruncateInsert,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct IngestTableConfig {
+    pub file_pattern: String,
+    pub target_table: String,
+    #[serde(default)]
+    pub key_columns: Vec<String>,
+    #[serde(default)]
+    pub create_if_missing: bool,
+}
+
+fn default_pattern() -> String {
+    "**/*.parquet".to_string()
+}
+
+fn default_ingest_file_format() -> FileFormat {
+    FileFormat::Parquet
+}
+
+fn default_ingest_batch_size() -> usize {
+    5000
+}
+
 impl PostgresConfig {
     pub fn connection_string(&self) -> String {
         let mut s = format!(
@@ -106,11 +216,42 @@ fn default_batch_size() -> usize {
     10_000
 }
 
+fn default_catalog_type() -> CatalogType {
+    CatalogType::Filesystem
+}
+
 pub fn load(path: &str) -> Result<Config> {
     let content = std::fs::read_to_string(Path::new(path))
         .with_context(|| format!("reading config from {path}"))?;
     let config: Config =
         serde_yaml::from_str(&content).with_context(|| format!("parsing config from {path}"))?;
+
+    // Validate: iceberg format requires a warehouse path
+    if config.format == OutputFormat::Iceberg && config.warehouse.is_none() {
+        anyhow::bail!("'warehouse' is required when format is 'iceberg'");
+    }
+
+    // Validate: glue catalog requires glue_database
+    if let Some(ref cat) = config.catalog {
+        if matches!(cat.catalog_type, CatalogType::Glue) && cat.glue_database.is_none() {
+            anyhow::bail!("'glue_database' is required when catalog type is 'glue'");
+        }
+    }
+
+    // Validate: upsert mode requires key_columns on each table mapping
+    if let Some(ref ingest) = config.ingest {
+        if ingest.write_mode == WriteMode::Upsert {
+            for table in &ingest.tables {
+                if table.key_columns.is_empty() {
+                    anyhow::bail!(
+                        "ingest table '{}' requires 'key_columns' when write_mode is 'upsert'",
+                        table.target_table
+                    );
+                }
+            }
+        }
+    }
+
     Ok(config)
 }
 
@@ -191,7 +332,7 @@ exclude:
 
         assert_eq!(config.exclude, vec!["migrations"]);
 
-        match config.output {
+        match config.output.unwrap() {
             OutputConfig::S3 {
                 bucket,
                 prefix,
@@ -285,5 +426,129 @@ exclude:
     fn load_nonexistent_file() {
         let result = load("/tmp/nonexistent_rustream_config_xyz.yaml");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_ingest_config_local() {
+        let yaml = r#"
+postgres:
+  host: localhost
+  database: testdb
+  user: postgres
+output:
+  type: local
+  path: ./output
+ingest:
+  input:
+    type: local
+    path: ./parquet_files
+    pattern: "**/*.parquet"
+  file_format: parquet
+  write_mode: upsert
+  batch_size: 3000
+  tables:
+    - file_pattern: "users/*.parquet"
+      target_table: users
+      key_columns: [id]
+      create_if_missing: true
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let ingest = config.ingest.unwrap();
+        assert!(matches!(ingest.input, InputConfig::Local { .. }));
+        assert_eq!(ingest.file_format, FileFormat::Parquet);
+        assert_eq!(ingest.write_mode, WriteMode::Upsert);
+        assert_eq!(ingest.batch_size, 3000);
+        assert_eq!(ingest.tables.len(), 1);
+        assert_eq!(ingest.tables[0].target_table, "users");
+        assert_eq!(ingest.tables[0].key_columns, vec!["id"]);
+        assert!(ingest.tables[0].create_if_missing);
+    }
+
+    #[test]
+    fn parse_ingest_config_s3() {
+        let yaml = r#"
+postgres:
+  host: localhost
+  database: testdb
+  user: postgres
+ingest:
+  input:
+    type: s3
+    bucket: my-bucket
+    prefix: raw/data
+    region: us-east-1
+  file_format: csv
+  write_mode: truncate_insert
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let ingest = config.ingest.unwrap();
+        match &ingest.input {
+            InputConfig::S3 {
+                bucket,
+                prefix,
+                region,
+                ..
+            } => {
+                assert_eq!(bucket, "my-bucket");
+                assert_eq!(prefix.as_deref(), Some("raw/data"));
+                assert_eq!(region.as_deref(), Some("us-east-1"));
+            }
+            _ => panic!("expected S3 input config"),
+        }
+        assert_eq!(ingest.file_format, FileFormat::Csv);
+        assert_eq!(ingest.write_mode, WriteMode::TruncateInsert);
+    }
+
+    #[test]
+    fn ingest_config_defaults() {
+        let yaml = r#"
+postgres:
+  host: localhost
+  database: testdb
+  user: postgres
+ingest:
+  input:
+    type: local
+    path: ./data
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let ingest = config.ingest.unwrap();
+        assert_eq!(ingest.file_format, FileFormat::Parquet);
+        assert_eq!(ingest.write_mode, WriteMode::Insert);
+        assert_eq!(ingest.batch_size, 5000);
+        assert_eq!(ingest.target_schema, "public");
+        assert!(ingest.tables.is_empty());
+    }
+
+    #[test]
+    fn config_without_ingest() {
+        let yaml = r#"
+postgres:
+  host: localhost
+  database: testdb
+  user: postgres
+output:
+  type: local
+  path: ./output
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.ingest.is_none());
+    }
+
+    #[test]
+    fn config_without_output() {
+        let yaml = r#"
+postgres:
+  host: localhost
+  database: testdb
+  user: postgres
+ingest:
+  input:
+    type: local
+    path: ./data
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.output.is_none());
+        assert!(config.ingest.is_some());
     }
 }

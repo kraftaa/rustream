@@ -1,4 +1,30 @@
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, TimeUnit};
+
+/// Map an Arrow DataType to a Postgres type name (for CREATE TABLE DDL).
+pub fn arrow_type_to_pg(dt: &DataType) -> &'static str {
+    match dt {
+        DataType::Boolean => "BOOLEAN",
+        DataType::Int8 => "SMALLINT",
+        DataType::Int16 => "SMALLINT",
+        DataType::Int32 => "INTEGER",
+        DataType::Int64 => "BIGINT",
+        DataType::UInt8 => "SMALLINT",
+        DataType::UInt16 => "INTEGER",
+        DataType::UInt32 => "BIGINT",
+        DataType::UInt64 => "BIGINT",
+        DataType::Float16 => "REAL",
+        DataType::Float32 => "REAL",
+        DataType::Float64 => "DOUBLE PRECISION",
+        DataType::Utf8 | DataType::LargeUtf8 => "TEXT",
+        DataType::Binary | DataType::LargeBinary => "BYTEA",
+        DataType::Date32 | DataType::Date64 => "DATE",
+        DataType::Timestamp(_, Some(_)) => "TIMESTAMPTZ",
+        DataType::Timestamp(_, None) => "TIMESTAMP",
+        DataType::Time32(_) | DataType::Time64(_) => "TIME",
+        DataType::Duration(_) => "INTERVAL",
+        _ => "TEXT",
+    }
+}
 
 /// Map a Postgres type name (from information_schema or pg_type) to an Arrow DataType.
 pub fn pg_type_to_arrow(pg_type: &str) -> DataType {
@@ -29,14 +55,12 @@ pub fn pg_type_to_arrow(pg_type: &str) -> DataType {
         // Date / Time
         "date" => DataType::Date32,
         "timestamp" | "timestamp without time zone" => {
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+            DataType::Timestamp(TimeUnit::Microsecond, None)
         }
         "timestamp with time zone" | "timestamptz" => {
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
         }
-        "time" | "time without time zone" => {
-            DataType::Time64(arrow::datatypes::TimeUnit::Microsecond)
-        }
+        "time" | "time without time zone" => DataType::Time64(TimeUnit::Microsecond),
         "interval" => DataType::Utf8, // intervals as string
 
         // UUID
@@ -172,5 +196,51 @@ mod tests {
     #[test]
     fn unknown_type_falls_back_to_utf8() {
         assert_eq!(pg_type_to_arrow("some_custom_type"), DataType::Utf8);
+    }
+
+    #[test]
+    fn arrow_type_to_pg_primitives() {
+        assert_eq!(arrow_type_to_pg(&DataType::Boolean), "BOOLEAN");
+        assert_eq!(arrow_type_to_pg(&DataType::Int16), "SMALLINT");
+        assert_eq!(arrow_type_to_pg(&DataType::Int32), "INTEGER");
+        assert_eq!(arrow_type_to_pg(&DataType::Int64), "BIGINT");
+        assert_eq!(arrow_type_to_pg(&DataType::Float32), "REAL");
+        assert_eq!(arrow_type_to_pg(&DataType::Float64), "DOUBLE PRECISION");
+        assert_eq!(arrow_type_to_pg(&DataType::Utf8), "TEXT");
+        assert_eq!(arrow_type_to_pg(&DataType::Binary), "BYTEA");
+        assert_eq!(arrow_type_to_pg(&DataType::Date32), "DATE");
+    }
+
+    #[test]
+    fn arrow_type_to_pg_timestamps() {
+        assert_eq!(
+            arrow_type_to_pg(&DataType::Timestamp(TimeUnit::Microsecond, None)),
+            "TIMESTAMP"
+        );
+        assert_eq!(
+            arrow_type_to_pg(&DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some(std::sync::Arc::from("UTC"))
+            )),
+            "TIMESTAMPTZ"
+        );
+    }
+
+    #[test]
+    fn arrow_type_to_pg_unsigned() {
+        assert_eq!(arrow_type_to_pg(&DataType::UInt8), "SMALLINT");
+        assert_eq!(arrow_type_to_pg(&DataType::UInt16), "INTEGER");
+        assert_eq!(arrow_type_to_pg(&DataType::UInt32), "BIGINT");
+        assert_eq!(arrow_type_to_pg(&DataType::UInt64), "BIGINT");
+    }
+
+    #[test]
+    fn arrow_type_to_pg_fallback() {
+        assert_eq!(
+            arrow_type_to_pg(&DataType::List(std::sync::Arc::new(
+                arrow::datatypes::Field::new("item", DataType::Int32, true)
+            ))),
+            "TEXT"
+        );
     }
 }
