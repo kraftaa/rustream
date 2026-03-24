@@ -42,6 +42,9 @@ rustream sync --config config.yaml --dry-run
 
 # Run sync
 rustream sync --config config.yaml
+
+# If you need to wipe saved watermarks/cursors (full resync)
+rustream sync --config config.yaml --reset-state
 ```
 
 ### Ingest (S3/local → Postgres)

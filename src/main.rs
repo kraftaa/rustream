@@ -38,6 +38,10 @@ enum Commands {
         /// Show what would be synced without actually doing it
         #[arg(long)]
         dry_run: bool,
+
+        /// Clear saved watermark/cursor state before running
+        #[arg(long, default_value_t = false)]
+        reset_state: bool,
     },
 
     /// Ingest Parquet/CSV files from local filesystem or S3 into Postgres
@@ -135,8 +139,10 @@ async fn main() -> Result<()> {
         Commands::Sync {
             config: config_path,
             dry_run,
+            reset_state,
         } => {
             let cfg = config::load(&config_path)?;
+            sync::maybe_reset_state(&cfg, reset_state)?;
             if dry_run {
                 sync::dry_run(cfg).await?;
             } else {
