@@ -125,6 +125,17 @@ enum Commands {
         #[arg(long, default_value = "0.0.0.0:8080")]
         bind: String,
     },
+
+    /// Reset stored watermarks/cursors (state) for all tables or one table
+    ResetState {
+        /// Optional table name to reset; if omitted resets all
+        #[arg(long)]
+        table: Option<String>,
+
+        /// State directory (default: .rustream_state)
+        #[arg(long)]
+        state_dir: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -215,6 +226,10 @@ async fn main() -> Result<()> {
             jobs::ensure_jobs_table(&client).await?;
             jobs::force_run_job(&client, job_id).await?;
             tracing::info!(job_id, "job marked pending for immediate run");
+        }
+
+        Commands::ResetState { table, state_dir } => {
+            sync::reset_state(state_dir, table)?;
         }
     }
 

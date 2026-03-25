@@ -168,6 +168,27 @@ pub fn maybe_reset_state(config: &Config, reset_state: bool) -> Result<()> {
     Ok(())
 }
 
+/// Reset state for all tables or a specific table.
+pub fn reset_state(state_dir: Option<String>, table: Option<String>) -> Result<()> {
+    let dir = state_dir.unwrap_or_else(|| ".rustream_state".to_string());
+    let path = std::path::Path::new(&dir).join("rustream_state.db");
+    if !path.exists() {
+        tracing::info!(state_dir = %dir, "state db not found; nothing to reset");
+        return Ok(());
+    }
+
+    if let Some(table_name) = table {
+        let store = StateStore::open(&dir)?;
+        store.clear_progress(&table_name)?;
+        tracing::info!(table = %table_name, "cleared state for table");
+    } else {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("removing state db at {}", path.display()))?;
+        tracing::info!(state_file = %path.display(), "cleared all state");
+    }
+    Ok(())
+}
+
 async fn sync_table(
     client: &tokio_postgres::Client,
     config: &Config,
