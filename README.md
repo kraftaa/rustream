@@ -92,10 +92,21 @@ rustream status-api --control-db-url "$CONTROL_DB_URL" --bind 0.0.0.0:8080
 #   /jobs/summary, /logs?limit=50, /health, /health/worker
 #   UI buttons: force run, retry failed, reset state
 
+# reset all state (CLI)
+rustream reset-state --state-dir .rustream_state
+
+# reset one table
+rustream reset-state --table users
+
 # optional: run a data-quality command on each local output table
 # (use {path} placeholder for the Parquet directory)
 RUSTREAM_DQ_CMD="dq-prof --input {path}" rustream worker --control-db-url "$CONTROL_DB_URL"
 ```
+
+### Production templates
+- Local: `examples/production-template/docker-compose.yml`
+- K8s: `examples/production-template/helm`
+- AWS: `examples/production-template/terraform`
 
 ## Configuration
 
