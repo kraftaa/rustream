@@ -2,10 +2,10 @@ use std::net::SocketAddr;
 
 use anyhow::Result;
 use axum::{
-    extract::{Query, State},
+    extract::{Form, Query, State},
     http::{header, StatusCode},
     response::{Redirect, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -29,6 +29,8 @@ pub async fn serve(control_db_url: String, addr: SocketAddr) -> Result<()> {
         .route("/jobs/html", get(list_jobs_html))
         .route("/jobs/summary", get(job_summary))
         .route("/logs", get(list_runs))
+        .route("/jobs/force", post(force_job))
+        .route("/health/worker", get(worker_health))
         .route("/health", get(health))
         .with_state(state);
 
@@ -133,11 +135,14 @@ async fn list_jobs_html(
     ));
     body.push_str("<button type=\"submit\">Apply</button></form>");
 
-    body.push_str("<table><tr><th>id</th><th>table</th><th>status</th><th>next_run</th><th>last_run</th><th>last_error</th></tr>");
+    body.push_str("<table><tr><th>id</th><th>table</th><th>status</th><th>next_run</th><th>last_run</th><th>last_error</th><th>actions</th></tr>");
     for r in rows {
         let status_class = format!("status-{}", r.status.to_ascii_lowercase());
         body.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td class=\"{}\">{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td class=\"{}\">{}</td><td>{}</td><td>{}</td><td>{}</td>\
+            <td><form method=\"post\" action=\"/jobs/force\" style=\"margin:0;\">\
+            <input type=\"hidden\" name=\"id\" value=\"{}\">\
+            <button type=\"submit\">Force run</button></form></td></tr>",
             r.id,
             r.table_name,
             status_class,
@@ -145,6 +150,7 @@ async fn list_jobs_html(
             r.next_run.unwrap_or_else(|| "-".to_string()),
             r.last_run.unwrap_or_else(|| "-".to_string()),
             r.last_error.unwrap_or_else(|| "-".to_string()),
+            r.id,
         ));
     }
     body.push_str("</table></body></html>");
@@ -208,4 +214,57 @@ async fn health() -> Response {
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body("ok".into())
         .unwrap()
+}
+
+async fn worker_health(State(state): State<AppState>) -> Result<Response, StatusCode> {
+    let client = jobs::connect(&state.control_db_url)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "health db connect failed");
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
+
+    let last_run: Option<chrono::DateTime<chrono::Utc>> = client
+        .query_opt(
+            "SELECT finished_at FROM rustream_job_runs WHERE finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 1",
+            &[],
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "health query failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .and_then(|row| row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(0));
+
+    let body = serde_json::json!({
+        "db": "ok",
+        "last_run": last_run.map(|dt| dt.to_rfc3339()),
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_string(&body).unwrap().into())
+        .unwrap())
+}
+
+#[derive(Debug, Deserialize)]
+struct ForceJobForm {
+    id: i32,
+}
+
+async fn force_job(
+    State(state): State<AppState>,
+    Form(form): Form<ForceJobForm>,
+) -> Result<Redirect, StatusCode> {
+    let client = jobs::connect(&state.control_db_url)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    jobs::ensure_jobs_table(&client)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    jobs::force_run_job(&client, form.id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Redirect::temporary("/jobs/html"))
 }
