@@ -45,6 +45,9 @@ rustream sync --config config.yaml
 
 # If you need to wipe saved watermarks/cursors (full resync)
 rustream sync --config config.yaml --reset-state
+
+# Reset state for one table
+rustream reset-state --table users
 ```
 
 ### Ingest (S3/local → Postgres)
@@ -86,7 +89,8 @@ rustream status-api --control-db-url "$CONTROL_DB_URL" --bind 0.0.0.0:8080
 # RUSTREAM_CONTROL_DB_URL=postgres://user:pass@host:5432/db rustream worker
 # status endpoints:
 #   /jobs (json, optional ?status=pending), /jobs/html (auto-refresh + filter),
-#   /jobs/summary, /logs?limit=50, /health
+#   /jobs/summary, /logs?limit=50, /health, /health/worker
+#   UI buttons: force run, retry failed, reset state
 
 # optional: run a data-quality command on each local output table
 # (use {path} placeholder for the Parquet directory)

@@ -11,18 +11,23 @@ use axum::{
 use serde::Deserialize;
 
 use crate::jobs;
+use crate::sync;
 
 #[derive(Clone)]
 struct AppState {
     control_db_url: String,
+    state_dir: String,
 }
 
-pub async fn serve(control_db_url: String, addr: SocketAddr) -> Result<()> {
+pub async fn serve(control_db_url: String, addr: SocketAddr, state_dir: Option<String>) -> Result<()> {
     // Ensure schema exists before serving requests (covers older control DBs without new columns).
     let client = jobs::connect(&control_db_url).await?;
     jobs::ensure_jobs_table(&client).await?;
 
-    let state = AppState { control_db_url };
+    let state = AppState {
+        control_db_url,
+        state_dir: state_dir.unwrap_or_else(|| ".rustream_state".to_string()),
+    };
     let app = Router::new()
         .route("/", get(root_redirect))
         .route("/jobs", get(list_jobs))
@@ -30,6 +35,8 @@ pub async fn serve(control_db_url: String, addr: SocketAddr) -> Result<()> {
         .route("/jobs/summary", get(job_summary))
         .route("/logs", get(list_runs))
         .route("/jobs/force", post(force_job))
+        .route("/jobs/retry", post(retry_job))
+        .route("/state/reset", post(reset_state))
         .route("/health/worker", get(worker_health))
         .route("/health", get(health))
         .with_state(state);
@@ -142,7 +149,9 @@ async fn list_jobs_html(
             "<tr><td>{}</td><td>{}</td><td class=\"{}\">{}</td><td>{}</td><td>{}</td><td>{}</td>\
             <td><form method=\"post\" action=\"/jobs/force\" style=\"margin:0;\">\
             <input type=\"hidden\" name=\"id\" value=\"{}\">\
-            <button type=\"submit\">Force run</button></form></td></tr>",
+            <button type=\"submit\">Force run</button></form>\
+            {}\
+            </td></tr>",
             r.id,
             r.table_name,
             status_class,
@@ -151,6 +160,38 @@ async fn list_jobs_html(
             r.last_run.unwrap_or_else(|| "-".to_string()),
             r.last_error.unwrap_or_else(|| "-".to_string()),
             r.id,
+            if r.status.eq_ignore_ascii_case("failed") {
+                format!(
+                    "<form method=\"post\" action=\"/jobs/retry\" style=\"margin-top:4px;\">
+<input type=\"hidden\" name=\"id\" value=\"{}\">
+<button type=\"submit\">Retry failed</button></form>",
+                    r.id
+                )
+            } else {
+                String::new()
+            },
+        ));
+    }
+    body.push_str("</table></body></html>");
+    // Recent runs table
+    let runs = jobs::list_job_runs(&state.control_db_url, 20)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "listing runs for HTML failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    body.push_str("<h3>Recent runs</h3><table><tr><th>run_id</th><th>job_id</th><th>status</th><th>duration_ms</th><th>severity</th><th>error</th><th>started_at</th><th>finished_at</th></tr>");
+    for r in runs {
+        body.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            r.id,
+            r.job_id,
+            r.status,
+            r.duration_ms.map(|d| d.to_string()).unwrap_or_else(|| "-".to_string()),
+            r.severity.unwrap_or_else(|| "-".to_string()),
+            r.error.unwrap_or_else(|| "-".to_string()),
+            r.started_at,
+            r.finished_at.unwrap_or_else(|| "-".to_string()),
         ));
     }
     body.push_str("</table></body></html>");
@@ -265,6 +306,37 @@ async fn force_job(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     jobs::force_run_job(&client, form.id)
         .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Redirect::temporary("/jobs/html"))
+}
+
+async fn retry_job(
+    State(state): State<AppState>,
+    Form(form): Form<ForceJobForm>,
+) -> Result<Redirect, StatusCode> {
+    // same as force; could add status check later
+    let client = jobs::connect(&state.control_db_url)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    jobs::ensure_jobs_table(&client)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    jobs::force_run_job(&client, form.id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Redirect::temporary("/jobs/html"))
+}
+
+#[derive(Debug, Deserialize)]
+struct ResetForm {
+    table: Option<String>,
+}
+
+async fn reset_state(
+    State(state): State<AppState>,
+    Form(form): Form<ResetForm>,
+) -> Result<Redirect, StatusCode> {
+    sync::reset_state(Some(state.state_dir.clone()), form.table.clone())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Redirect::temporary("/jobs/html"))
 }

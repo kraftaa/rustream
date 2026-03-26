@@ -1,0 +1,17 @@
+postgres:
+  host: postgres
+  database: demo
+  user: demo
+  password: demo
+
+output:
+  type: s3
+  bucket: rustream-demo
+  prefix: raw/postgres
+  region: us-east-1
+  endpoint: http://minio:9000
+
+tables:
+  - name: users
+    incremental_column: updated_at
+    incremental_tiebreaker_column: id

@@ -86,6 +86,7 @@ pub async fn ensure_jobs_table(client: &Client) -> Result<()> {
                 job_id INTEGER NOT NULL REFERENCES rustream_jobs(id) ON DELETE CASCADE,
                 started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 finished_at TIMESTAMPTZ,
+                duration_ms BIGINT,
                 status TEXT NOT NULL,
                 error TEXT,
                 severity TEXT,
@@ -111,6 +112,13 @@ pub async fn ensure_jobs_table(client: &Client) -> Result<()> {
         )
         .await
         .context("adding metrics_json column to rustream_job_runs")?;
+    client
+        .execute(
+            "ALTER TABLE rustream_job_runs ADD COLUMN IF NOT EXISTS duration_ms BIGINT",
+            &[],
+        )
+        .await
+        .context("adding duration_ms column to rustream_job_runs")?;
 
     Ok(())
 }
@@ -256,7 +264,12 @@ pub async fn finish_job_run(
     client
         .execute(
             "UPDATE rustream_job_runs
-             SET status = $1, error = $2, severity = $3, metrics_json = $4, finished_at = now()
+             SET status = $1,
+                 error = $2,
+                 severity = $3,
+                 metrics_json = $4,
+                 finished_at = now(),
+                 duration_ms = EXTRACT(EPOCH FROM (now() - started_at))*1000
              WHERE id = $5",
             &[&status, &error, &severity, &metrics_json, &run_id],
         )
@@ -285,6 +298,7 @@ pub struct JobRun {
     pub status: String,
     pub started_at: String,
     pub finished_at: Option<String>,
+    pub duration_ms: Option<i64>,
     pub error: Option<String>,
     pub severity: Option<String>,
     pub metrics_json: Option<String>,
@@ -294,7 +308,7 @@ pub async fn list_job_runs(control_db_url: &str, limit: i64) -> Result<Vec<JobRu
     let client = connect(control_db_url).await?;
     let rows = client
         .query(
-            "SELECT id, job_id, status, started_at, finished_at, error, severity, metrics_json
+            "SELECT id, job_id, status, started_at, finished_at, duration_ms, error, severity, metrics_json
              FROM rustream_job_runs
              ORDER BY started_at DESC
              LIMIT $1",
@@ -313,9 +327,10 @@ pub async fn list_job_runs(control_db_url: &str, limit: i64) -> Result<Vec<JobRu
             status: r.get(2),
             started_at: started.to_rfc3339(),
             finished_at: finished.map(|dt| dt.to_rfc3339()),
-            error: r.get(5),
-            severity: r.get(6),
-            metrics_json: r.get(7),
+            duration_ms: r.get(5),
+            error: r.get(6),
+            severity: r.get(7),
+            metrics_json: r.get(8),
         });
     }
     Ok(out)

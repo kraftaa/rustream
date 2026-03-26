@@ -124,6 +124,10 @@ enum Commands {
         /// Bind address, e.g. 0.0.0.0:8080
         #[arg(long, default_value = "0.0.0.0:8080")]
         bind: String,
+
+        /// State directory for resets (optional; default .rustream_state)
+        #[arg(long)]
+        state_dir: Option<String>,
     },
 
     /// Reset stored watermarks/cursors (state) for all tables or one table
@@ -212,10 +216,11 @@ async fn main() -> Result<()> {
         Commands::StatusApi {
             control_db_url,
             bind,
+            state_dir,
         } => {
             let control_db_url = resolve_control_db_url(control_db_url)?;
             let addr: std::net::SocketAddr = bind.parse()?;
-            status_api::serve(control_db_url, addr).await?;
+            status_api::serve(control_db_url, addr, state_dir).await?;
         }
         Commands::ForceJob {
             control_db_url,

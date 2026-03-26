@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rustream.fullname" . }}-status
+spec:
+  selector:
+    app: rustream-status
+  ports:
+    - port: 80
+      targetPort: {{ .Values.statusApi.port }}
+      protocol: TCP
+      name: http
