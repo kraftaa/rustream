@@ -117,6 +117,10 @@ async fn list_jobs_html(
         "<div style=\"margin-bottom:10px;\">pending: {} · running: {} · failed: {} · total: {}</div>",
         summary.pending, summary.running, summary.failed, summary.total
     ));
+    body.push_str(
+        "<form method=\"post\" action=\"/state/reset\" style=\"margin-bottom:10px;\">
+<button type=\"submit\">Reset all state</button></form>",
+    );
 
     body.push_str("<form method=\"get\" action=\"/jobs/html\" class=\"toolbar\">");
     body.push_str("<label>Status filter: <select name=\"status\">");
@@ -145,20 +149,28 @@ async fn list_jobs_html(
     body.push_str("<table><tr><th>id</th><th>table</th><th>status</th><th>next_run</th><th>last_run</th><th>last_error</th><th>actions</th></tr>");
     for r in rows {
         let status_class = format!("status-{}", r.status.to_ascii_lowercase());
+        let table_name = escape_html(&r.table_name);
+        let status_text = escape_html(&r.status);
+        let next_run = escape_html(&r.next_run.unwrap_or_else(|| "-".to_string()));
+        let last_run = escape_html(&r.last_run.unwrap_or_else(|| "-".to_string()));
+        let last_error = escape_html(&r.last_error.unwrap_or_else(|| "-".to_string()));
         body.push_str(&format!(
             "<tr><td>{}</td><td>{}</td><td class=\"{}\">{}</td><td>{}</td><td>{}</td><td>{}</td>\
             <td><form method=\"post\" action=\"/jobs/force\" style=\"margin:0;\">\
             <input type=\"hidden\" name=\"id\" value=\"{}\">\
             <button type=\"submit\">Force run</button></form>\
             {}\
+            <form method=\"post\" action=\"/state/reset\" style=\"margin-top:4px;\">\
+            <input type=\"hidden\" name=\"table\" value=\"{}\">\
+            <button type=\"submit\">Reset state</button></form>\
             </td></tr>",
             r.id,
-            r.table_name,
+            table_name,
             status_class,
-            r.status,
-            r.next_run.unwrap_or_else(|| "-".to_string()),
-            r.last_run.unwrap_or_else(|| "-".to_string()),
-            r.last_error.unwrap_or_else(|| "-".to_string()),
+            status_text,
+            next_run,
+            last_run,
+            last_error,
             r.id,
             if r.status.eq_ignore_ascii_case("failed") {
                 format!(
@@ -170,9 +182,10 @@ async fn list_jobs_html(
             } else {
                 String::new()
             },
+            table_name,
         ));
     }
-    body.push_str("</table></body></html>");
+    body.push_str("</table>");
     // Recent runs table
     let runs = jobs::list_job_runs(&state.control_db_url, 20)
         .await
@@ -186,12 +199,12 @@ async fn list_jobs_html(
             "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             r.id,
             r.job_id,
-            r.status,
+            escape_html(&r.status),
             r.duration_ms.map(|d| d.to_string()).unwrap_or_else(|| "-".to_string()),
-            r.severity.unwrap_or_else(|| "-".to_string()),
-            r.error.unwrap_or_else(|| "-".to_string()),
-            r.started_at,
-            r.finished_at.unwrap_or_else(|| "-".to_string()),
+            escape_html(&r.severity.unwrap_or_else(|| "-".to_string())),
+            escape_html(&r.error.unwrap_or_else(|| "-".to_string())),
+            escape_html(&r.started_at),
+            escape_html(&r.finished_at.unwrap_or_else(|| "-".to_string())),
         ));
     }
     body.push_str("</table></body></html>");
@@ -239,7 +252,7 @@ async fn list_runs(
     State(state): State<AppState>,
     Query(query): Query<RunsQuery>,
 ) -> Result<Json<Vec<jobs::JobRun>>, StatusCode> {
-    let limit = query.limit.unwrap_or(50);
+    let limit = query.limit.unwrap_or(50).clamp(1, 1000);
     jobs::list_job_runs(&state.control_db_url, limit)
         .await
         .map(Json)
@@ -264,6 +277,10 @@ async fn worker_health(State(state): State<AppState>) -> Result<Response, Status
             tracing::error!(error = %e, "health db connect failed");
             StatusCode::SERVICE_UNAVAILABLE
         })?;
+    jobs::ensure_jobs_table(&client).await.map_err(|e| {
+        tracing::error!(error = %e, "health ensure schema failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let last_run: Option<chrono::DateTime<chrono::Utc>> = client
         .query_opt(
@@ -339,4 +356,12 @@ async fn reset_state(
     sync::reset_state(Some(state.state_dir.clone()), form.table.clone())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Redirect::temporary("/jobs/html"))
+}
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }

@@ -23,7 +23,7 @@ resource "aws_s3_bucket" "rustream" {
 data "aws_iam_policy_document" "rustream" {
   statement {
     actions   = ["s3:*"]
-    resources = [aws_s3_bucket_rustream.arn, "${aws_s3_bucket_rustream.arn}/*"]
+    resources = [aws_s3_bucket.rustream.arn, "${aws_s3_bucket.rustream.arn}/*"]
   }
 }
 

@@ -12,7 +12,7 @@ docker compose up --build
 
 Services:
 - Postgres (demo/demo)
-- MinIO (admin/admin) at http://localhost:9001
+- MinIO (minioadmin/minioadmin) at http://localhost:9001
 - rustream worker (polls jobs table)
 - rustream status API (port 8080)
 

@@ -269,7 +269,7 @@ pub async fn finish_job_run(
                  severity = $3,
                  metrics_json = $4,
                  finished_at = now(),
-                 duration_ms = EXTRACT(EPOCH FROM (now() - started_at))*1000
+                 duration_ms = (EXTRACT(EPOCH FROM (now() - started_at))*1000)::BIGINT
              WHERE id = $5",
             &[&status, &error, &severity, &metrics_json, &run_id],
         )
