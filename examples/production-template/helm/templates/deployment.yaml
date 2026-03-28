@@ -1,0 +1,82 @@
+{{- if .Values.worker.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rustream.fullname" . }}-worker
+  labels:
+    app: rustream
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rustream
+  template:
+    metadata:
+      labels:
+        app: rustream
+    spec:
+      containers:
+        - name: worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - worker
+            - --control-db-url
+            - {{ .Values.controlDbUrl | quote }}
+            - --poll-seconds
+            - "{{ .Values.worker.pollSeconds }}"
+          env:
+            {{- range .Values.env }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: state
+              mountPath: {{ .Values.stateDir }}
+      volumes:
+        - name: state
+          emptyDir: {}
+{{- end }}
+
+{{- if .Values.statusApi.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rustream.fullname" . }}-status
+  labels:
+    app: rustream-status
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rustream-status
+  template:
+    metadata:
+      labels:
+        app: rustream-status
+    spec:
+      containers:
+        - name: status-api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - status-api
+            - --control-db-url
+            - {{ .Values.controlDbUrl | quote }}
+            - --bind
+            - "0.0.0.0:{{ .Values.statusApi.port }}"
+            - --state-dir
+            - {{ .Values.stateDir | quote }}
+          ports:
+            - containerPort: {{ .Values.statusApi.port }}
+          env:
+            {{- range .Values.env }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+{{- end }}

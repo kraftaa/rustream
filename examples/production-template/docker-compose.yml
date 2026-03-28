@@ -1,0 +1,57 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+      POSTGRES_DB: demo
+    ports:
+      - "5432:5432"
+
+  minio:
+    image: quay.io/minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  rustream-worker:
+    build: ../..
+    depends_on:
+      - postgres
+      - minio
+    environment:
+      RUSTREAM_CONTROL_DB_URL: postgres://demo:demo@postgres:5432/demo
+      RUSTREAM_S3_ENDPOINT: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      RUST_LOG: rustream=info
+    command: >
+      sh -c "
+        rustream init-jobs --control-db-url $$RUSTREAM_CONTROL_DB_URL &&
+        rustream add-job --control-db-url $$RUSTREAM_CONTROL_DB_URL --table users --config /config/config.yaml --interval-secs 300 &&
+        rustream worker --control-db-url $$RUSTREAM_CONTROL_DB_URL --poll-seconds 5
+      "
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+
+  rustream-status:
+    build: ../..
+    depends_on:
+      - postgres
+    environment:
+      RUSTREAM_CONTROL_DB_URL: postgres://demo:demo@postgres:5432/demo
+      RUST_LOG: rustream=info
+    ports:
+      - "8080:8080"
+    command: rustream status-api --control-db-url ${RUSTREAM_CONTROL_DB_URL:-postgres://demo:demo@postgres:5432/demo} --bind 0.0.0.0:8080
+
+volumes:
+  minio-data:

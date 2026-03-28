@@ -141,11 +141,51 @@ pub async fn run(config: Config) -> Result<()> {
     for table in &tables {
         if let Err(e) = sync_table(&client, &config, table, &state, iceberg_catalog.as_ref()).await
         {
-            tracing::error!(table = %table.full_name(), error = %e, "failed to sync table");
+            tracing::error!(table = %table.full_name(), error = ?e, "failed to sync table");
         }
     }
 
     tracing::info!("sync complete");
+    Ok(())
+}
+
+/// Optionally clear all saved state (watermarks/cursors) before a run.
+pub fn maybe_reset_state(config: &Config, reset_state: bool) -> Result<()> {
+    if !reset_state {
+        return Ok(());
+    }
+
+    let state_dir = config
+        .state_dir
+        .clone()
+        .unwrap_or_else(|| ".rustream_state".to_string());
+    let path = std::path::Path::new(&state_dir).join("rustream_state.db");
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("removing state db at {}", path.display()))?;
+        tracing::warn!("reset state: deleted {}", path.display());
+    }
+    Ok(())
+}
+
+/// Reset state for all tables or a specific table.
+pub fn reset_state(state_dir: Option<String>, table: Option<String>) -> Result<()> {
+    let dir = state_dir.unwrap_or_else(|| ".rustream_state".to_string());
+    let path = std::path::Path::new(&dir).join("rustream_state.db");
+    if !path.exists() {
+        tracing::info!(state_dir = %dir, "state db not found; nothing to reset");
+        return Ok(());
+    }
+
+    if let Some(table_name) = table {
+        let store = StateStore::open(&dir)?;
+        store.clear_progress(&table_name)?;
+        tracing::info!(table = %table_name, "cleared state for table");
+    } else {
+        let store = StateStore::open(&dir)?;
+        store.clear_all_progress()?;
+        tracing::info!(state_file = %path.display(), "cleared all state");
+    }
     Ok(())
 }
 
@@ -239,6 +279,24 @@ async fn sync_table(
         },
         None => (None, None),
     };
+
+    // Clear invalid stored progress (e.g., cursor stored as text when column is int).
+    if let Some(wm) = &watermark_val {
+        if !schema::value_fits_column(wm, watermark_col.unwrap(), &columns) {
+            tracing::warn!(table = %table_name, value = %wm, "clearing invalid stored watermark");
+            state.clear_progress(&table_name)?;
+            watermark_val = None;
+            cursor_val = None;
+        }
+    }
+    if let (Some(cur_col), Some(cur_val)) = (cursor_col, &cursor_val) {
+        if !schema::value_fits_column(cur_val, cur_col, &columns) {
+            tracing::warn!(table = %table_name, value = %cur_val, "clearing invalid stored cursor");
+            state.clear_progress(&table_name)?;
+            watermark_val = None;
+            cursor_val = None;
+        }
+    }
 
     let mut total_rows = 0u64;
     let mut batch_num = 0u32;

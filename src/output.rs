@@ -11,7 +11,18 @@ pub async fn write_output(config: &OutputConfig, key: &str, data: Vec<u8>) -> Re
             bucket,
             prefix,
             region,
-        } => write_s3(bucket, prefix, region.as_deref(), key, data).await,
+            endpoint,
+        } => {
+            write_s3(
+                bucket,
+                prefix,
+                region.as_deref(),
+                endpoint.as_deref(),
+                key,
+                data,
+            )
+            .await
+        }
     }
 }
 
@@ -36,6 +47,7 @@ async fn write_s3(
     bucket: &str,
     prefix: &str,
     region: Option<&str>,
+    endpoint: Option<&str>,
     key: &str,
     data: Vec<u8>,
 ) -> Result<()> {
@@ -44,7 +56,20 @@ async fn write_s3(
         config_loader = config_loader.region(aws_config::Region::new(r.to_string()));
     }
     let aws_config = config_loader.load().await;
-    let client = aws_sdk_s3::Client::new(&aws_config);
+
+    let endpoint_override = endpoint
+        .map(ToOwned::to_owned)
+        .or_else(|| std::env::var("RUSTREAM_S3_ENDPOINT").ok());
+
+    let client = if let Some(endpoint_url) = endpoint_override {
+        let s3_cfg = aws_sdk_s3::config::Builder::from(&aws_config)
+            .endpoint_url(endpoint_url)
+            .force_path_style(true)
+            .build();
+        aws_sdk_s3::Client::from_conf(s3_cfg)
+    } else {
+        aws_sdk_s3::Client::new(&aws_config)
+    };
 
     let s3_key = format!("{}/{}", prefix.trim_end_matches('/'), key);
 
