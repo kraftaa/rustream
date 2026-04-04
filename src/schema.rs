@@ -96,7 +96,9 @@ pub fn value_fits_column(value: &str, column_name: &str, columns: &[ColumnInfo])
         "real" | "double precision" | "numeric" => value.parse::<f64>().is_ok(),
         "boolean" => value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false"),
         "uuid" => uuid::Uuid::parse_str(value).is_ok(),
-        "timestamp without time zone" | "timestamp with time zone" => chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f").is_ok(),
+        "timestamp without time zone" | "timestamp with time zone" => {
+            chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f").is_ok()
+        }
         "date" => chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok(),
         _ => true,
     }

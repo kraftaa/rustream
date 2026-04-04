@@ -19,7 +19,11 @@ struct AppState {
     state_dir: String,
 }
 
-pub async fn serve(control_db_url: String, addr: SocketAddr, state_dir: Option<String>) -> Result<()> {
+pub async fn serve(
+    control_db_url: String,
+    addr: SocketAddr,
+    state_dir: Option<String>,
+) -> Result<()> {
     // Ensure schema exists before serving requests (covers older control DBs without new columns).
     let client = jobs::connect(&control_db_url).await?;
     jobs::ensure_jobs_table(&client).await?;
@@ -271,12 +275,10 @@ async fn health() -> Response {
 }
 
 async fn worker_health(State(state): State<AppState>) -> Result<Response, StatusCode> {
-    let client = jobs::connect(&state.control_db_url)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "health db connect failed");
-            StatusCode::SERVICE_UNAVAILABLE
-        })?;
+    let client = jobs::connect(&state.control_db_url).await.map_err(|e| {
+        tracing::error!(error = %e, "health db connect failed");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
     jobs::ensure_jobs_table(&client).await.map_err(|e| {
         tracing::error!(error = %e, "health ensure schema failed");
         StatusCode::INTERNAL_SERVER_ERROR
