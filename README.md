@@ -42,6 +42,12 @@ rustream sync --config config.yaml --dry-run
 
 # Run sync
 rustream sync --config config.yaml
+
+# If you need to wipe saved watermarks/cursors (full resync)
+rustream sync --config config.yaml --reset-state
+
+# Reset state for one table
+rustream reset-state --table users
 ```
 
 ### Ingest (S3/local → Postgres)
@@ -60,6 +66,47 @@ Enable debug logging with `RUST_LOG`:
 RUST_LOG=rustream=debug rustream sync --config config.yaml
 RUST_LOG=rustream=debug rustream ingest --config ingest_config.yaml
 ```
+
+### Jobs / Worker (experimental)
+
+```
+# create control-plane table in Postgres
+rustream init-jobs --control-db-url "$CONTROL_DB_URL"
+
+# enqueue a table sync job
+rustream add-job --control-db-url "$CONTROL_DB_URL" --table users --config config.yaml --interval-secs 300 --timeout-secs 900 --max-concurrent-jobs 1
+
+# run the worker loop (polls every 5s by default, runs up to 4 jobs at once)
+rustream worker --control-db-url "$CONTROL_DB_URL" --poll-seconds 5 --max-concurrent 4
+
+# force a job to run ASAP
+rustream force-job --control-db-url "$CONTROL_DB_URL" --job-id 1
+
+# status API (optional, returns JSON)
+rustream status-api --control-db-url "$CONTROL_DB_URL" --bind 0.0.0.0:8080
+
+# control DB URL can also come from env
+# RUSTREAM_CONTROL_DB_URL=postgres://user:pass@host:5432/db rustream worker
+# status endpoints:
+#   /jobs (json, optional ?status=pending), /jobs/html (auto-refresh + filter),
+#   /jobs/summary, /logs?limit=50, /health, /health/worker
+#   UI buttons: force run, retry failed, reset state
+
+# reset all state (CLI)
+rustream reset-state --state-dir .rustream_state
+
+# reset one table
+rustream reset-state --table users
+
+# optional: run a data-quality command on each local output table
+# (use {path} placeholder for the Parquet directory)
+RUSTREAM_DQ_CMD="dq-prof --input {path}" rustream worker --control-db-url "$CONTROL_DB_URL"
+```
+
+### Production templates
+- Local: `examples/production-template/docker-compose.yml`
+- K8s: `examples/production-template/helm`
+- AWS: `examples/production-template/terraform`
 
 ## Configuration
 

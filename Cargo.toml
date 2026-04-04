@@ -51,6 +51,7 @@ serde_json = "1"
 bytes = "1"
 glob = "0.3"
 arrow-csv = "57"
+axum = { version = "0.7", features = ["json"] }
 
 [features]
 default = []

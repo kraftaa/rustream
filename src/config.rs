@@ -73,6 +73,8 @@ pub enum OutputConfig {
         prefix: String,
         #[serde(default)]
         region: Option<String>,
+        #[serde(default)]
+        endpoint: Option<String>,
     },
 }
 
@@ -337,10 +339,12 @@ exclude:
                 bucket,
                 prefix,
                 region,
+                endpoint,
             } => {
                 assert_eq!(bucket, "my-bucket");
                 assert_eq!(prefix, "raw/pg");
                 assert_eq!(region.as_deref(), Some("us-west-2"));
+                assert_eq!(endpoint, None);
             }
             _ => panic!("expected S3 output"),
         }

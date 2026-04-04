@@ -130,6 +130,22 @@ impl StateStore {
 
         Ok(())
     }
+
+    /// Clear stored watermark/cursor for a table (used when state is incompatible with schema).
+    pub fn clear_progress(&self, table_name: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM watermarks WHERE table_name = ?1", [table_name])
+            .with_context(|| format!("clearing progress for {table_name}"))?;
+        Ok(())
+    }
+
+    /// Clear all progress rows.
+    pub fn clear_all_progress(&self) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM watermarks", [])
+            .context("clearing all progress")?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

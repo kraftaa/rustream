@@ -1,0 +1,25 @@
+image:
+  repository: ghcr.io/kraftaa/rustream
+  tag: latest
+  pullPolicy: IfNotPresent
+
+controlDbUrl: "postgres://demo:demo@postgres:5432/demo"
+stateDir: "/var/lib/rustream"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+worker:
+  enabled: true
+  pollSeconds: 5
+
+statusApi:
+  enabled: true
+  port: 8080
+
+env: []
