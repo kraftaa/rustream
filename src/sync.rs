@@ -139,8 +139,17 @@ pub async fn run(config: Config) -> Result<()> {
     };
 
     let mut failures = Vec::new();
+    let fail_on_empty_columns = config.tables.is_some();
     for table in &tables {
-        if let Err(e) = sync_table(&client, &config, table, &state, iceberg_catalog.as_ref()).await
+        if let Err(e) = sync_table(
+            &client,
+            &config,
+            table,
+            &state,
+            fail_on_empty_columns,
+            iceberg_catalog.as_ref(),
+        )
+        .await
         {
             tracing::error!(table = %table.full_name(), error = ?e, "failed to sync table");
             failures.push(format!("{}: {e}", table.full_name()));
@@ -204,6 +213,7 @@ async fn sync_table(
     config: &Config,
     table: &TableConfig,
     state: &StateStore,
+    fail_on_empty_columns: bool,
     iceberg_catalog: Option<&Arc<dyn Catalog>>,
 ) -> Result<()> {
     let table_name = table.full_name();
@@ -212,6 +222,12 @@ async fn sync_table(
     // Introspect schema
     let columns = schema::introspect_table(client, table).await?;
     if columns.is_empty() {
+        if fail_on_empty_columns {
+            return Err(anyhow!(
+                "table {} has no visible columns (table missing or no privileges)",
+                table_name
+            ));
+        }
         tracing::warn!(table = %table_name, "no columns found, skipping");
         return Ok(());
     }
@@ -784,7 +800,7 @@ mod tests {
             ingest: None,
         };
 
-        sync_table(&client, &config, &table, &state, None).await?;
+        sync_table(&client, &config, &table, &state, false, None).await?;
 
         // Validate only remaining ids (3,4) are written.
         let mut seen_ids = Vec::new();
@@ -909,7 +925,7 @@ mod tests {
             ingest: None,
         };
 
-        let err = sync_table(&client, &config, &table, &state, None)
+        let err = sync_table(&client, &config, &table, &state, false, None)
             .await
             .expect_err("cursor mode should fail when saved cursor is missing");
         assert!(err.to_string().contains("has watermark but no cursor"));
@@ -917,6 +933,67 @@ mod tests {
         client
             .execute(&format!("DROP TABLE {full_table}"), &[])
             .await?;
+
+        Ok(())
+    }
+
+    /// Explicit table mode should fail when table is missing or has no visible columns.
+    #[tokio::test]
+    async fn sync_table_fails_when_explicit_table_has_no_columns() -> Result<()> {
+        let db_url = match std::env::var("RUSTREAM_IT_DB_URL") {
+            Ok(v) => v,
+            Err(_) => return Ok(()), // Optional integration-style test.
+        };
+
+        let (client, connection) = tokio_postgres::connect(&db_url, NoTls).await?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let table = TableConfig {
+            name: format!("rustream_it_missing_table_{suffix}"),
+            schema: Some("public".to_string()),
+            columns: None,
+            incremental_column: None,
+            incremental_tiebreaker_column: None,
+            incremental_column_is_unique: false,
+            partition_by: None,
+        };
+
+        let tmp = tempfile::tempdir()?;
+        let out_dir = tmp.path().join("out");
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&out_dir)?;
+        std::fs::create_dir_all(&state_dir)?;
+
+        let state = StateStore::open(state_dir.to_str().unwrap())?;
+        let config = Config {
+            postgres: PostgresConfig {
+                host: "localhost".to_string(),
+                port: 5432,
+                database: "ignored_for_sync_table_test".to_string(),
+                user: "ignored".to_string(),
+                password: None,
+            },
+            output: Some(OutputConfig::Local {
+                path: out_dir.to_string_lossy().to_string(),
+            }),
+            tables: Some(vec![table.clone()]),
+            exclude: vec![],
+            schema: "public".to_string(),
+            batch_size: 2,
+            state_dir: Some(state_dir.to_string_lossy().to_string()),
+            format: OutputFormat::Parquet,
+            catalog: None,
+            warehouse: None,
+            ingest: None,
+        };
+
+        let err = sync_table(&client, &config, &table, &state, true, None)
+            .await
+            .expect_err("explicit missing table should fail");
+        assert!(err.to_string().contains("has no visible columns"));
 
         Ok(())
     }
@@ -1002,7 +1079,7 @@ mod tests {
             ingest: None,
         };
 
-        sync_table(&client, &config, &table, &state, None).await?;
+        sync_table(&client, &config, &table, &state, false, None).await?;
         let progress = state.get_progress(&full_table)?.unwrap();
         assert_eq!(progress.0, "4");
         assert_eq!(progress.1, None);

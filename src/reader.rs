@@ -131,6 +131,7 @@ enum SqlParam {
     F32(f32),
     F64(f64),
     Bool(bool),
+    Uuid(uuid::Uuid),
     Timestamp(NaiveDateTime),
     Timestamptz(DateTime<Utc>),
     Date(NaiveDate),
@@ -146,6 +147,7 @@ impl SqlParam {
             Self::F32(v) => v,
             Self::F64(v) => v,
             Self::Bool(v) => v,
+            Self::Uuid(v) => v,
             Self::Timestamp(v) => v,
             Self::Timestamptz(v) => v,
             Self::Date(v) => v,
@@ -169,6 +171,7 @@ fn parse_param(columns: &[ColumnInfo], column: Option<&str>, raw: &str) -> Resul
         "real" => SqlParam::F32(raw.parse()?),
         "double precision" => SqlParam::F64(raw.parse()?),
         "boolean" => SqlParam::Bool(raw.parse()?),
+        "uuid" => SqlParam::Uuid(uuid::Uuid::parse_str(raw)?),
         "timestamp without time zone" => {
             SqlParam::Timestamp(NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")?)
         }
@@ -378,6 +381,24 @@ mod tests {
 
         let param = parse_param(&columns, Some("id"), "42").unwrap();
         assert!(matches!(param, SqlParam::I32(42)));
+    }
+
+    #[test]
+    fn parse_param_parses_uuid() {
+        let columns = vec![ColumnInfo {
+            name: "event_id".into(),
+            pg_type: "uuid".into(),
+            arrow_type: DataType::Utf8,
+            is_nullable: false,
+        }];
+
+        let param = parse_param(
+            &columns,
+            Some("event_id"),
+            "550e8400-e29b-41d4-a716-446655440000",
+        )
+        .unwrap();
+        assert!(matches!(param, SqlParam::Uuid(_)));
     }
 
     #[test]

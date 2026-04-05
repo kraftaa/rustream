@@ -99,7 +99,7 @@ enum Commands {
         #[arg(long, default_value_t = 5)]
         poll_seconds: u64,
 
-        /// Maximum jobs to execute concurrently
+        /// Maximum jobs to execute concurrently (currently advisory; worker runs sequentially)
         #[arg(long, default_value_t = 2)]
         max_concurrent: usize,
     },

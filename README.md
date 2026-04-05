@@ -76,7 +76,7 @@ rustream init-jobs --control-db-url "$CONTROL_DB_URL"
 # enqueue a table sync job
 rustream add-job --control-db-url "$CONTROL_DB_URL" --table users --config config.yaml --interval-secs 300 --timeout-secs 900 --max-concurrent-jobs 1
 
-# run the worker loop (polls every 5s by default, runs up to 4 jobs at once)
+# run the worker loop (polls every 5s; currently executes jobs sequentially)
 rustream worker --control-db-url "$CONTROL_DB_URL" --poll-seconds 5 --max-concurrent 4
 
 # force a job to run ASAP
