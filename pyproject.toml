@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "rustream"
-version = "0.3.1"
+version = "0.3.2"
 description = "Fast Postgres → Parquet sync tool"
 readme = "README.md"
 requires-python = ">=3.8"
