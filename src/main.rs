@@ -59,14 +59,14 @@ enum Commands {
     InitJobs {
         /// Control-plane Postgres connection string
         #[arg(long)]
-        control_db_url: String,
+        control_db_url: Option<String>,
     },
 
     /// Enqueue a single table sync job
     AddJob {
         /// Control-plane Postgres connection string
         #[arg(long)]
-        control_db_url: String,
+        control_db_url: Option<String>,
 
         /// Table name to sync
         #[arg(long)]
@@ -93,7 +93,7 @@ enum Commands {
     Worker {
         /// Control-plane Postgres connection string
         #[arg(long)]
-        control_db_url: String,
+        control_db_url: Option<String>,
 
         /// Poll interval when no jobs are pending (seconds)
         #[arg(long, default_value_t = 5)]
@@ -108,7 +108,7 @@ enum Commands {
     ForceJob {
         /// Control-plane Postgres connection string
         #[arg(long)]
-        control_db_url: String,
+        control_db_url: Option<String>,
 
         /// Job ID
         #[arg(long)]
@@ -119,7 +119,7 @@ enum Commands {
     StatusApi {
         /// Control-plane Postgres connection string
         #[arg(long)]
-        control_db_url: String,
+        control_db_url: Option<String>,
 
         /// Bind address, e.g. 0.0.0.0:8080
         #[arg(long, default_value = "0.0.0.0:8080")]
@@ -269,7 +269,22 @@ async fn run_worker(
 }
 
 async fn process_job(client: &mut tokio_postgres::Client, job: jobs::Job) -> Result<()> {
-    let interval = job.interval_secs as i64;
+    if job.interval_secs <= 0 {
+        return Err(anyhow::anyhow!(
+            "invalid interval_secs={} for job {}",
+            job.interval_secs,
+            job.id
+        ));
+    }
+    if job.timeout_secs < 0 {
+        return Err(anyhow::anyhow!(
+            "invalid timeout_secs={} for job {}",
+            job.timeout_secs,
+            job.id
+        ));
+    }
+
+    let interval = i64::from(job.interval_secs);
     tracing::debug!(
         job_id = job.id,
         max_concurrent = job.max_concurrent_jobs,
@@ -383,9 +398,11 @@ async fn run_dq_prof(cmd_template: &str, path: &str) -> Result<(Option<String>, 
     Ok((severity, Some(stdout)))
 }
 
-fn resolve_control_db_url(flag_value: String) -> Result<String> {
-    if !flag_value.is_empty() {
-        return Ok(flag_value);
+fn resolve_control_db_url(flag_value: Option<String>) -> Result<String> {
+    if let Some(v) = flag_value {
+        if !v.is_empty() {
+            return Ok(v);
+        }
     }
     if let Ok(env_val) = std::env::var("RUSTREAM_CONTROL_DB_URL") {
         if !env_val.is_empty() {

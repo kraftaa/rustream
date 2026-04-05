@@ -131,9 +131,8 @@ pub async fn enqueue_job(
     max_concurrent_jobs: Option<i32>,
     timeout_secs: Option<i32>,
 ) -> Result<i32> {
-    let interval = interval_secs.unwrap_or(DEFAULT_INTERVAL_SECS) as i32;
-    let max_concurrent_jobs = max_concurrent_jobs.unwrap_or(1);
-    let timeout_secs = timeout_secs.unwrap_or(0);
+    let (interval, max_concurrent_jobs, timeout_secs) =
+        validated_schedule(interval_secs, max_concurrent_jobs, timeout_secs)?;
     let row = client
         .query_one(
             "INSERT INTO rustream_jobs (table_name, config_path, interval_secs, max_concurrent_jobs, timeout_secs)
@@ -389,28 +388,55 @@ fn row_to_job(row: &Row) -> Job {
 /// Returns local output path for the table if output is local.
 pub async fn run_job(job: &Job) -> Result<Option<String>> {
     let mut cfg = crate::config::load(&job.config_path)?;
+    let (requested_schema, requested_name) = parse_table_ref(&job.table_name);
+    let configured_tables = cfg.tables.clone().unwrap_or_default();
 
     // Preserve the original table config if present; otherwise, synthesize a minimal entry.
-    let maybe_table = cfg
-        .tables
-        .unwrap_or_default()
+    let mut matches = configured_tables
         .iter()
-        .find(|t| t.name == job.table_name)
-        .cloned();
+        .filter(|t| {
+            if let Some(schema) = requested_schema.as_deref() {
+                t.name == requested_name && t.schema_or_public() == schema
+            } else {
+                t.name == requested_name
+            }
+        })
+        .cloned()
+        .collect::<Vec<_>>();
 
-    cfg.tables = Some(vec![maybe_table.unwrap_or(TableConfig {
-        name: job.table_name.clone(),
-        schema: None,
-        columns: None,
-        incremental_column: None,
-        incremental_tiebreaker_column: None,
-        incremental_column_is_unique: false,
-        partition_by: None,
-    })]);
+    if requested_schema.is_none() && matches.len() > 1 {
+        let schemas = matches
+            .iter()
+            .map(|t| t.schema_or_public().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(anyhow!(
+            "job {} table '{}' is ambiguous across schemas [{}]; use schema-qualified table name",
+            job.id,
+            requested_name,
+            schemas
+        ));
+    }
+
+    let selected_table = if let Some(t) = matches.pop() {
+        t
+    } else {
+        TableConfig {
+            name: requested_name.to_string(),
+            schema: requested_schema,
+            columns: None,
+            incremental_column: None,
+            incremental_tiebreaker_column: None,
+            incremental_column_is_unique: false,
+            partition_by: None,
+        }
+    };
+
+    cfg.tables = Some(vec![selected_table.clone()]);
 
     let local_output = match &cfg.output {
         Some(crate::config::OutputConfig::Local { path }) => {
-            Some(format!("{}/{}", path, job.table_name))
+            Some(format!("{}/{}", path, selected_table.name))
         }
         _ => None,
     };
@@ -425,4 +451,80 @@ pub async fn run_job(job: &Job) -> Result<Option<String>> {
     })?;
 
     Ok(local_output)
+}
+
+fn parse_table_ref(table_ref: &str) -> (Option<String>, &str) {
+    if let Some((schema, name)) = table_ref.split_once('.') {
+        if !schema.is_empty() && !name.is_empty() {
+            return (Some(schema.to_string()), name);
+        }
+    }
+    (None, table_ref)
+}
+
+fn validated_schedule(
+    interval_secs: Option<i64>,
+    max_concurrent_jobs: Option<i32>,
+    timeout_secs: Option<i32>,
+) -> Result<(i32, i32, i32)> {
+    let interval_i64 = interval_secs.unwrap_or(DEFAULT_INTERVAL_SECS);
+    if interval_i64 <= 0 {
+        return Err(anyhow!("interval_secs must be > 0"));
+    }
+    if interval_i64 > i32::MAX as i64 {
+        return Err(anyhow!(
+            "interval_secs too large: {} (max {})",
+            interval_i64,
+            i32::MAX
+        ));
+    }
+    let interval = interval_i64 as i32;
+
+    let max_concurrent = max_concurrent_jobs.unwrap_or(1);
+    if max_concurrent <= 0 {
+        return Err(anyhow!("max_concurrent_jobs must be > 0"));
+    }
+
+    let timeout = timeout_secs.unwrap_or(0);
+    if timeout < 0 {
+        return Err(anyhow!("timeout_secs must be >= 0"));
+    }
+
+    Ok((interval, max_concurrent, timeout))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_table_ref_with_schema() {
+        let (schema, name) = parse_table_ref("analytics.users");
+        assert_eq!(schema.as_deref(), Some("analytics"));
+        assert_eq!(name, "users");
+    }
+
+    #[test]
+    fn parse_table_ref_without_schema() {
+        let (schema, name) = parse_table_ref("users");
+        assert_eq!(schema, None);
+        assert_eq!(name, "users");
+    }
+
+    #[test]
+    fn validated_schedule_defaults() {
+        let (interval, max_concurrent, timeout) = validated_schedule(None, None, None).unwrap();
+        assert_eq!(interval, 300);
+        assert_eq!(max_concurrent, 1);
+        assert_eq!(timeout, 0);
+    }
+
+    #[test]
+    fn validated_schedule_rejects_invalid_values() {
+        assert!(validated_schedule(Some(0), None, None).is_err());
+        assert!(validated_schedule(Some(-1), None, None).is_err());
+        assert!(validated_schedule(Some(1), Some(0), None).is_err());
+        assert!(validated_schedule(Some(1), None, Some(-5)).is_err());
+        assert!(validated_schedule(Some(i64::from(i32::MAX) + 1), None, None).is_err());
+    }
 }

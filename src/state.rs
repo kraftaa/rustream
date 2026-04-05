@@ -139,6 +139,27 @@ impl StateStore {
         Ok(())
     }
 
+    /// Clear progress rows by table reference.
+    /// For bare names (e.g. `users`), clears both `users` and schema-qualified keys like `analytics.users`.
+    pub fn clear_progress_by_table_ref(&self, table_ref: &str) -> Result<usize> {
+        let deleted = if table_ref.contains('.') {
+            self.conn
+                .execute("DELETE FROM watermarks WHERE table_name = ?1", [table_ref])
+                .with_context(|| format!("clearing progress for {table_ref}"))?
+        } else {
+            let suffix = format!("%.{}", table_ref);
+            self.conn
+                .execute(
+                    "DELETE FROM watermarks WHERE table_name = ?1 OR table_name LIKE ?2",
+                    rusqlite::params![table_ref, suffix],
+                )
+                .with_context(|| {
+                    format!("clearing progress for {table_ref} and schema-qualified variants")
+                })?
+        };
+        Ok(deleted)
+    }
+
     /// Clear all progress rows.
     pub fn clear_all_progress(&self) -> Result<()> {
         self.conn
@@ -279,6 +300,44 @@ mod tests {
                 Some(("persisted".to_string(), None))
             );
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_progress_by_table_ref_clears_bare_and_schema_qualified() {
+        let dir = temp_state_dir();
+        let store = StateStore::open(&dir).unwrap();
+
+        store.set_progress("users", "a", None).unwrap();
+        store.set_progress("analytics.users", "b", None).unwrap();
+        store.set_progress("sales.users", "c", None).unwrap();
+        store.set_progress("orders", "d", None).unwrap();
+
+        let deleted = store.clear_progress_by_table_ref("users").unwrap();
+        assert_eq!(deleted, 3);
+        assert_eq!(store.get_progress("users").unwrap(), None);
+        assert_eq!(store.get_progress("analytics.users").unwrap(), None);
+        assert_eq!(store.get_progress("sales.users").unwrap(), None);
+        assert!(store.get_progress("orders").unwrap().is_some());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_progress_by_table_ref_schema_qualified_exact_only() {
+        let dir = temp_state_dir();
+        let store = StateStore::open(&dir).unwrap();
+
+        store.set_progress("analytics.users", "b", None).unwrap();
+        store.set_progress("sales.users", "c", None).unwrap();
+
+        let deleted = store
+            .clear_progress_by_table_ref("analytics.users")
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(store.get_progress("analytics.users").unwrap(), None);
+        assert!(store.get_progress("sales.users").unwrap().is_some());
 
         let _ = fs::remove_dir_all(&dir);
     }

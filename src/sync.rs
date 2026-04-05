@@ -198,8 +198,8 @@ pub fn reset_state(state_dir: Option<String>, table: Option<String>) -> Result<(
 
     if let Some(table_name) = table {
         let store = StateStore::open(&dir)?;
-        store.clear_progress(&table_name)?;
-        tracing::info!(table = %table_name, "cleared state for table");
+        let deleted = store.clear_progress_by_table_ref(&table_name)?;
+        tracing::info!(table = %table_name, deleted, "cleared state for table reference");
     } else {
         let store = StateStore::open(&dir)?;
         store.clear_all_progress()?;
