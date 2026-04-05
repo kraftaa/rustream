@@ -9,7 +9,27 @@ permissions:
   contents: write
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check
+        run: cargo check --all-targets
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Format
+        run: cargo fmt -- --check
+
+      - name: Test
+        run: cargo test --all-targets
+
   build-linux:
+    needs: verify
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -43,6 +63,7 @@ jobs:
           path: target/wheels/*.whl
 
   build-macos:
+    needs: verify
     runs-on: macos-latest
     strategy:
       matrix:
@@ -74,6 +95,7 @@ jobs:
           path: target/wheels/*.whl
 
   build-windows:
+    needs: verify
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

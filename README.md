@@ -299,6 +299,18 @@ export RUSTREAM_IT_DB_URL="host=localhost port=5432 dbname=mydb user=postgres pa
 cargo test
 ```
 
+## Verify Before Push/Tag
+
+Run this locally before pushing or creating a release tag:
+
+```bash
+cargo fmt -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+```
+
+Tag releases also run the same checks in `.github/workflows/release.yml` before wheel build/publish.
+
 ## How it works
 
 ### Sync (Postgres → Parquet)

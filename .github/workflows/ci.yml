@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 jobs:
@@ -14,10 +13,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Check
-        run: cargo check
+        run: cargo check --all-targets
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Format
         run: cargo fmt -- --check
+
+      - name: Test
+        run: cargo test --all-targets

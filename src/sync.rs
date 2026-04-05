@@ -138,11 +138,21 @@ pub async fn run(config: Config) -> Result<()> {
         None
     };
 
+    let mut failures = Vec::new();
     for table in &tables {
         if let Err(e) = sync_table(&client, &config, table, &state, iceberg_catalog.as_ref()).await
         {
             tracing::error!(table = %table.full_name(), error = ?e, "failed to sync table");
+            failures.push(format!("{}: {e}", table.full_name()));
         }
+    }
+
+    if !failures.is_empty() {
+        return Err(anyhow!(
+            "{} table(s) failed during sync: {}",
+            failures.len(),
+            failures.join(" | ")
+        ));
     }
 
     tracing::info!("sync complete");

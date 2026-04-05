@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use arrow::array::*;
 use arrow::datatypes::{DataType, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use std::sync::Arc;
-use tokio_postgres::types::Type;
+use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, Row};
 
 use crate::config::TableConfig;
@@ -80,14 +80,28 @@ pub async fn read_batch(
     tracing::debug!(%query, "executing query");
 
     let rows = match (options.watermark_val, options.cursor_val) {
-        (Some(wm), Some(cur)) if options.cursor_col.is_some() => client
-            .query(&query as &str, &[&wm, &cur])
-            .await
-            .with_context(|| format!("querying table {}", table.full_name()))?,
-        (Some(wm), _) => client
-            .query(&query as &str, &[&wm])
-            .await
-            .with_context(|| format!("querying table {}", table.full_name()))?,
+        (Some(wm), Some(cur)) if options.cursor_col.is_some() => {
+            let wm_param = parse_param(columns, options.watermark_col, wm).with_context(|| {
+                format!("parsing watermark parameter for {}", table.full_name())
+            })?;
+            let cur_param = parse_param(columns, options.cursor_col, cur)
+                .with_context(|| format!("parsing cursor parameter for {}", table.full_name()))?;
+            let params: [&(dyn ToSql + Sync); 2] = [wm_param.as_tosql(), cur_param.as_tosql()];
+            client
+                .query(&query as &str, &params)
+                .await
+                .with_context(|| format!("querying table {}", table.full_name()))?
+        }
+        (Some(wm), _) => {
+            let wm_param = parse_param(columns, options.watermark_col, wm).with_context(|| {
+                format!("parsing watermark parameter for {}", table.full_name())
+            })?;
+            let params: [&(dyn ToSql + Sync); 1] = [wm_param.as_tosql()];
+            client
+                .query(&query as &str, &params)
+                .await
+                .with_context(|| format!("querying table {}", table.full_name()))?
+        }
         (None, _) => client
             .query(&query as &str, &[])
             .await
@@ -108,6 +122,68 @@ pub async fn read_batch(
         .context("building RecordBatch from PG rows")?;
 
     Ok(Some(batch))
+}
+
+enum SqlParam {
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    F32(f32),
+    F64(f64),
+    Bool(bool),
+    Timestamp(NaiveDateTime),
+    Timestamptz(DateTime<Utc>),
+    Date(NaiveDate),
+    Text(String),
+}
+
+impl SqlParam {
+    fn as_tosql(&self) -> &(dyn ToSql + Sync) {
+        match self {
+            Self::I16(v) => v,
+            Self::I32(v) => v,
+            Self::I64(v) => v,
+            Self::F32(v) => v,
+            Self::F64(v) => v,
+            Self::Bool(v) => v,
+            Self::Timestamp(v) => v,
+            Self::Timestamptz(v) => v,
+            Self::Date(v) => v,
+            Self::Text(v) => v,
+        }
+    }
+}
+
+fn parse_param(columns: &[ColumnInfo], column: Option<&str>, raw: &str) -> Result<SqlParam> {
+    let Some(col_name) = column else {
+        return Ok(SqlParam::Text(raw.to_string()));
+    };
+    let Some(col) = columns.iter().find(|c| c.name == col_name) else {
+        return Ok(SqlParam::Text(raw.to_string()));
+    };
+
+    let parsed = match col.pg_type.as_str() {
+        "smallint" => SqlParam::I16(raw.parse()?),
+        "integer" => SqlParam::I32(raw.parse()?),
+        "bigint" => SqlParam::I64(raw.parse()?),
+        "real" => SqlParam::F32(raw.parse()?),
+        "double precision" => SqlParam::F64(raw.parse()?),
+        "boolean" => SqlParam::Bool(raw.parse()?),
+        "timestamp without time zone" => {
+            SqlParam::Timestamp(NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")?)
+        }
+        "timestamp with time zone" => {
+            let dt = DateTime::parse_from_rfc3339(raw)
+                .map(|d| d.with_timezone(&Utc))
+                .or_else(|_| {
+                    NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f").map(|d| d.and_utc())
+                })?;
+            SqlParam::Timestamptz(dt)
+        }
+        "date" => SqlParam::Date(NaiveDate::parse_from_str(raw, "%Y-%m-%d")?),
+        _ => SqlParam::Text(raw.to_string()),
+    };
+    Ok(parsed)
 }
 
 /// Convert a column from PG rows into an Arrow Array.
@@ -275,6 +351,33 @@ mod tests {
                 is_nullable: true,
             },
         ]
+    }
+
+    #[test]
+    fn parse_param_parses_timestamp_without_timezone() {
+        let columns = vec![ColumnInfo {
+            name: "updated_at".into(),
+            pg_type: "timestamp without time zone".into(),
+            arrow_type: DataType::Timestamp(TimeUnit::Microsecond, None),
+            is_nullable: false,
+        }];
+
+        let param =
+            parse_param(&columns, Some("updated_at"), "2026-01-05 10:20:30.123456").unwrap();
+        assert!(matches!(param, SqlParam::Timestamp(_)));
+    }
+
+    #[test]
+    fn parse_param_parses_integer_cursor() {
+        let columns = vec![ColumnInfo {
+            name: "id".into(),
+            pg_type: "integer".into(),
+            arrow_type: DataType::Int32,
+            is_nullable: false,
+        }];
+
+        let param = parse_param(&columns, Some("id"), "42").unwrap();
+        assert!(matches!(param, SqlParam::I32(42)));
     }
 
     #[test]
